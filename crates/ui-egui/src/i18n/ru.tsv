@@ -383,7 +383,7 @@ column	Author	Автор
 	Choose version	Выбрать версию
 	Launcher version	Версия лаунчера
 	Nightly	Ночная сборка
-	No nightly build published yet	Ночные сборки пока не опубликованы
+	Nightly (none published yet)	Ночная сборка (пока нет)
 	Install version {version}	Установить версию {version}
 	Download selected version	Скачать выбранную версию
 	Older launcher versions require a manual reinstall.	Для возврата к старой версии лаунчера нужна переустановка вручную.

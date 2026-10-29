@@ -389,7 +389,7 @@ column	Author	Autor
 	Choose version	Wybierz wersję
 	Launcher version	Wersja programu uruchamiającego
 	Nightly	Wersja nocna
-	No nightly build published yet	Nie opublikowano jeszcze wersji nocnej
+	Nightly (none published yet)	Wersja nocna (jeszcze brak)
 	Install version {version}	Zainstaluj wersję {version}
 	Download selected version	Pobierz wybraną wersję
 	Older launcher versions require a manual reinstall.	Starsze wersje programu uruchamiającego wymagają ręcznej ponownej instalacji.

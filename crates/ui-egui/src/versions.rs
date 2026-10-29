@@ -84,7 +84,7 @@ impl LauncherUi {
             .height(390.0)
             .show_ui(ui, |ui| {
                 // The combo already scrolls its entire menu. Keep every option, including
-                // Nightly and its availability note, in that one scroll region.
+                // Nightly, in that one scroll region.
                 ui.spacing_mut().item_spacing.y = 10.0;
                 let option_size = egui::vec2(ui.available_width(), 42.0);
                 if ui.add(egui::Button::selectable(choice == VersionTrack::Stable, tl!("Latest release")).min_size(option_size)).clicked() {
@@ -94,12 +94,10 @@ impl LauncherUi {
                     .as_ref()
                     .and_then(|r| r.as_ref().ok())
                     .is_some_and(|rs| rs.iter().any(|r| is_nightly(r) && self.has_version_download(app, r)));
-                if ui.add_enabled(nightly, egui::Button::selectable(choice == VersionTrack::Nightly, tl!("Nightly")).min_size(option_size)).clicked()
-                {
+                // Without a build, the reason rides in the disabled row itself, not a line of its own.
+                let label = if nightly { tl!("Nightly") } else { tl!("Nightly (none published yet)") };
+                if ui.add_enabled(nightly, egui::Button::selectable(choice == VersionTrack::Nightly, label).min_size(option_size)).clicked() {
                     picked = Some(VersionTrack::Nightly);
-                }
-                if !nightly {
-                    ui.label(RichText::new(tl!("No nightly build published yet")).color(t.muted));
                 }
                 ui.separator();
                 match &list {

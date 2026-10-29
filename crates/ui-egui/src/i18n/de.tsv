@@ -387,7 +387,7 @@ column	Author	Autor
 	Choose version	Version auswählen
 	Launcher version	Launcher-Version
 	Nightly	Nightly
-	No nightly build published yet	Noch kein Nightly-Build veröffentlicht
+	Nightly (none published yet)	Nightly (noch keins veröffentlicht)
 	Install version {version}	Version {version} installieren
 	Download selected version	Ausgewählte Version herunterladen
 	Older launcher versions require a manual reinstall.	Ältere Launcher-Versionen müssen manuell neu installiert werden.

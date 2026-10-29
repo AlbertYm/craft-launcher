@@ -385,7 +385,7 @@ column	Author	Auteur
 	Choose version	Choisir une version
 	Launcher version	Version du lanceur
 	Nightly	Nocturne
-	No nightly build published yet	Aucune version nocturne publiée pour le moment
+	Nightly (none published yet)	Nocturne (pas encore publiée)
 	Install version {version}	Installer la version {version}
 	Download selected version	Télécharger la version choisie
 	Older launcher versions require a manual reinstall.	Les anciennes versions du lanceur nécessitent une réinstallation manuelle.

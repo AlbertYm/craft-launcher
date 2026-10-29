@@ -355,7 +355,7 @@ column	Author	Autor
 	Choose version	Vybrat verzi
 	Launcher version	Verze spouštěče
 	Nightly	Noční sestavení
-	No nightly build published yet	Zatím nebylo vydáno žádné noční sestavení
+	Nightly (none published yet)	Noční sestavení (zatím žádné)
 	Install version {version}	Nainstalovat verzi {version}
 	Download selected version	Stáhnout vybranou verzi
 	Older launcher versions require a manual reinstall.	Starší verze spouštěče vyžadují ruční přeinstalaci.

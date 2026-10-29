@@ -368,7 +368,7 @@ column	Author	Autor
 	Choose version	Elegir versión
 	Launcher version	Versión del iniciador
 	Nightly	Nocturna
-	No nightly build published yet	Todavía no se ha publicado ninguna versión nocturna
+	Nightly (none published yet)	Nocturna (aún no publicada)
 	Install version {version}	Instalar la versión {version}
 	Download selected version	Descargar la versión seleccionada
 	Older launcher versions require a manual reinstall.	Las versiones anteriores del iniciador requieren una reinstalación manual.

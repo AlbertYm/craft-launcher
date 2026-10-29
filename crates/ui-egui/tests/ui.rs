@@ -388,7 +388,7 @@ fn app_and_launcher_offer_version_choices_without_starting_an_install() {
     h.get_by_role_and_label(egui::accesskit::Role::ComboBox, "Launcher version").click();
     h.run_steps(3);
     h.get_by_label("Latest release");
-    h.get_by_label("No nightly build published yet");
+    h.get_by_label("Nightly (none published yet)");
     assert!(h.query_by_label("Launcher versions").is_none(), "version selection belongs in Settings, not another dialog");
     assert!(sent.borrow().iter().any(|c| matches!(c, Command::ListVersions { app } if app == artcraft_launcher_core::catalog::LAUNCHER_ID)));
 }
@@ -412,7 +412,7 @@ fn version_choices_have_room_and_nightly_scrolls_with_the_versions() {
     h.run_steps(4);
     h.get_by_role_and_label(egui::accesskit::Role::ComboBox, "Launcher version").click();
     h.run_steps(5);
-    let nightly_before = h.get_by_label("Nightly").rect();
+    let nightly_before = h.get_by_label("Nightly (none published yet)").rect();
     let first = h.get_by_label("v0.25.0").rect();
     assert!(nightly_before.height() >= 40.0, "dropdown rows need a comfortable target: {nightly_before:?}");
     assert!(first.top() - nightly_before.bottom() >= 8.0, "choices need breathing room: {nightly_before:?} {first:?}");
@@ -425,7 +425,7 @@ fn version_choices_have_room_and_nightly_scrolls_with_the_versions() {
         modifiers: egui::Modifiers::NONE,
     });
     h.run_steps(30);
-    let nightly_after = h.get_by_label("Nightly").rect();
+    let nightly_after = h.get_by_label("Nightly (none published yet)").rect();
     assert!(nightly_after.top() < nightly_before.top() - 80.0, "Nightly must scroll with release rows: {nightly_before:?} -> {nightly_after:?}");
 }
 

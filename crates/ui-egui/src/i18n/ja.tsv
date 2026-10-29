@@ -390,7 +390,7 @@ column	Author	作者
 	Choose version	バージョンを選択
 	Launcher version	ランチャーのバージョン
 	Nightly	ナイトリービルド
-	No nightly build published yet	公開済みのナイトリービルドはまだありません
+	Nightly (none published yet)	ナイトリービルド（未公開）
 	Install version {version}	バージョン {version} をインストール
 	Download selected version	選択したバージョンをダウンロード
 	Older launcher versions require a manual reinstall.	古いランチャーに戻すには手動で再インストールする必要があります。
