@@ -124,6 +124,13 @@ fn each_outcome_tells_the_person_what_is_installed_now() {
     assert!(odd.contains("Check which version of FilmCraft is installed"), "{odd}");
 }
 
+/// An all-users downgrade with no elevated session stops before removing anything, and says so.
+#[test]
+fn without_the_one_prompt_session_nothing_is_changed() {
+    let message = no_session("FilmCraft", "0.13.0");
+    assert!(message.contains("go back to FilmCraft 0.13.0") && message.contains("nothing was changed"), "{message}");
+}
+
 #[test]
 fn only_a_real_product_code_reaches_the_elevated_session() {
     assert_eq!(removal("{3D425FF2-3EB2-4950-9833-95B01B102845}"), Ok("/x {3D425FF2-3EB2-4950-9833-95B01B102845} /passive /norestart".into()));

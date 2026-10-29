@@ -2034,7 +2034,8 @@ pub mod windows {
     /// Goes back to `chosen` from a newer installed copy, which the app packages won't install
     /// over: removes it, installs `chosen` in the same folder and context, and puts `previous`
     /// back if that does not finish (see [`msi_downgrade`]). An all-users copy does all three
-    /// under one permission prompt; a per-user copy needs none, and runs them one by one.
+    /// under one permission prompt, or not at all; a per-user copy needs none, and runs them one
+    /// by one in a single turn of the installer queue.
     pub(super) fn downgrade_msi(
         app: &CraftApp,
         chosen: Package<'_>,
@@ -2050,19 +2051,23 @@ pub mod windows {
                 elevated = downgrade_elevated(app, &chosen, &previous, destination, scope)?;
                 Ok(())
             })?;
-            if let Some(ended) = elevated {
-                return msi_downgrade::report(ended, app.name, chosen.version, previous.version);
-            }
-            log::warn!("{}: couldn't start the elevated session; going back one step at a time", app.name);
+            // Separate prompts are no fallback: refusing a later one would leave no app at all.
+            return match elevated {
+                Some(ended) => msi_downgrade::report(ended, app.name, chosen.version, previous.version),
+                None => Err(msi_downgrade::no_session(app.name, chosen.version)),
+            };
         }
-        let phase = std::cell::RefCell::new(phase);
-        msi_downgrade::run(msi_downgrade::Steps {
-            app: app.name,
-            chosen: chosen.version,
-            previous: previous.version,
-            remove: &mut || remove_msi_registrations(app, stop, &mut **phase.borrow_mut()),
-            install_chosen: &mut || run_msi(chosen.file, destination, scope, stop, &mut **phase.borrow_mut()),
-            reinstall_previous: &mut || run_msi(previous.file, destination, scope, stop, &mut **phase.borrow_mut()),
+        // One turn for all three steps: once the copy is removed, nothing waiting in the queue
+        // (another install, or a cancel while waiting) can stop the put-back.
+        in_turn(stop, phase, JobPhase::Installing, || {
+            msi_downgrade::run(msi_downgrade::Steps {
+                app: app.name,
+                chosen: chosen.version,
+                previous: previous.version,
+                remove: &mut || remove_registrations(app),
+                install_chosen: &mut || run_direct(chosen.file, destination, scope),
+                reinstall_previous: &mut || run_direct(previous.file, destination, scope),
+            })
         })
     }
 
@@ -2106,29 +2111,28 @@ pub mod windows {
     }
 
     pub fn uninstall_msi(app: &CraftApp, stop: &Stop, phase: &mut dyn FnMut(JobPhase)) -> Result<(), String> {
-        remove_msi_registrations(app, stop, phase).map_err(|removal| removal.error)
+        in_turn(stop, phase, JobPhase::Removing, || remove_registrations(app).map_err(|removal| removal.error))
     }
 
-    /// Removes every Windows Installer registration of `app` in turn. A failure says whether an
-    /// earlier registration was already removed, so a downgrade knows the app is partly gone.
-    fn remove_msi_registrations(app: &CraftApp, stop: &Stop, phase: &mut dyn FnMut(JobPhase)) -> Result<(), msi_downgrade::Removal> {
+    /// Removes every Windows Installer registration of `app` in turn, within the caller's queue
+    /// turn. A failure says whether an earlier registration was already removed, so a downgrade
+    /// knows the app is partly gone.
+    fn remove_registrations(app: &CraftApp) -> Result<(), msi_downgrade::Removal> {
         let installs = crate::detect::windows::msi_installs(app);
         if installs.is_empty() {
             return Err(msi_downgrade::Removal { error: format!("{} isn't registered with the Windows Installer", app.name), partly: false });
         }
-        let mut removed = 0;
-        let result = in_turn(stop, phase, JobPhase::Removing, || {
-            for m in &installs {
-                let status = process::command(msiexec())
-                    .args(["/x", &m.product_code, "/passive", "/norestart"])
-                    .status()
-                    .map_err(|e| format!("couldn't start the Windows Installer ({e})"))?;
-                explain(status.code())?;
-                removed += 1;
+        for (removed, m) in installs.iter().enumerate() {
+            let status = process::command(msiexec())
+                .args(["/x", &m.product_code, "/passive", "/norestart"])
+                .status()
+                .map_err(|e| format!("couldn't start the Windows Installer ({e})"))
+                .and_then(|status| explain(status.code()));
+            if let Err(error) = status {
+                return Err(msi_downgrade::Removal { error, partly: removed > 0 });
             }
-            Ok(())
-        });
-        result.map_err(|error| msi_downgrade::Removal { error, partly: removed > 0 })
+        }
+        Ok(())
     }
 }
 

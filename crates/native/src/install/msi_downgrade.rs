@@ -17,8 +17,11 @@
 //! The session is given only `msiexec` command lines for the two held, checked packages and the
 //! installed copy's product codes, as [`msi_batch`](super::msi_batch) does for Update all.
 //!
-//! A per-user copy needs no permission, so its steps run one after another ([`run`]); that is
-//! also the fallback when the elevated session cannot start.
+//! If that session cannot start, an all-users downgrade stops before anything is removed: falling
+//! back to one prompt per step would bring the trap back.
+//!
+//! A per-user copy needs no permission, so its steps run one after another ([`run`]), all in one
+//! turn of the installer queue: once the copy is removed, nothing queued can stop the put-back.
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
@@ -86,6 +89,11 @@ fn partly_removed_not_put_back(app: &str, previous: &str, why: &str, again: &str
     format!("{app} {previous} couldn't be fully removed ({why}), and putting it back failed too ({again}). Install {app} again from the launcher.")
 }
 
+/// An all-users downgrade whose one-prompt session could not start: nothing was removed.
+pub(super) fn no_session(app: &str, chosen: &str) -> String {
+    format!("couldn't ask Windows for permission to go back to {app} {chosen}, so nothing was changed.")
+}
+
 /// A refused permission prompt reads as what happened, not as the cancel code.
 fn reason(error: &str) -> String {
     if error == CANCELLED { "permission wasn't given".to_string() } else { error.to_string() }
@@ -143,7 +151,7 @@ pub(super) enum Ended {
     Done,
     /// The one prompt was refused: nothing ran.
     Declined,
-    /// The session never started; the per-user route can still be tried.
+    /// The session never started; nothing ran.
     LaunchFailed,
     RemovalFailed(i32),
     /// The chosen version failed with this code, and the previous one is back.
@@ -180,7 +188,7 @@ pub(super) fn ended(code: Option<i32>) -> Ended {
 }
 
 /// What a finished elevated downgrade means for the person. `LaunchFailed` is not passed here:
-/// the caller falls back to [`run`] instead.
+/// the caller reports [`no_session`] instead.
 pub(super) fn report(ended: Ended, app: &str, chosen: &str, previous: &str) -> Result<(), String> {
     // Inside the session permission was already given: a cancel there is the progress window's.
     let msiexec = |code: i32| match super::explain(Some(code)).err().unwrap_or_default() {
