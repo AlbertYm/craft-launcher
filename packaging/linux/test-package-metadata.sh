@@ -12,7 +12,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 check_packages() {
   local arch="$1" target="$2" floor="$3" expected="$4" deb_arch="$5"
-  local work="$TMP/$arch-${floor:-default}" deb rpm_requires
+  local work="$TMP/$arch-${floor:-default}" deb actual_arch deb_requires rpm_requires
   mkdir -p "$work/target/$target/release"
   printf '#!/bin/sh\necho "ArtCraft Launcher packaging fixture"\n' >"$work/target/$target/release/artcraft-launcher"
   chmod +x "$work/target/$target/release/artcraft-launcher"
@@ -26,10 +26,21 @@ check_packages() {
     bash "$ROOT/packaging/linux/package.sh" --skip-build --formats "deb rpm"
   )
   deb="$work/dist/artcraft-launcher-0.0.0-linux-$arch.deb"
-  [[ "$(dpkg-deb -f "$deb" Architecture)" = "$deb_arch" ]]
-  dpkg-deb -f "$deb" Depends | tr ',' '\n' | grep -Fxq "libc6 (>= $expected)"
+  actual_arch="$(dpkg-deb -f "$deb" Architecture)"
+  [[ "$actual_arch" = "$deb_arch" ]] || {
+    echo "error: $arch GLIBC_FLOOR=${floor:-empty}: expected deb architecture $deb_arch, got $actual_arch" >&2
+    return 1
+  }
+  deb_requires="$(dpkg-deb -f "$deb" Depends)"
+  tr ',' '\n' <<<"$deb_requires" | sed 's/^ *//' | grep -Fxq "libc6 (>= $expected)" || {
+    echo "error: $arch GLIBC_FLOOR=${floor:-empty}: expected libc6 >= $expected; deb Depends: $deb_requires" >&2
+    return 1
+  }
   rpm_requires="$(rpm -qp --requires "$work/dist/artcraft-launcher-0.0.0-linux-$arch.rpm")"
-  grep -Fxq "glibc >= $expected" <<<"$rpm_requires"
+  grep -Fxq "glibc >= $expected" <<<"$rpm_requires" || {
+    echo "error: $arch GLIBC_FLOOR=${floor:-empty}: expected glibc >= $expected; rpm Requires: $rpm_requires" >&2
+    return 1
+  }
   echo "ok: $arch GLIBC_FLOOR=${floor:-empty} -> deb/rpm >= $expected"
 }
 
