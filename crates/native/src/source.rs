@@ -25,14 +25,21 @@ pub struct Answer {
 /// Looks up latest releases. Called from worker threads.
 pub trait ReleaseSource: Send + Sync {
     fn latest(&self, repo: &str, prereleases: bool) -> Answer;
+    /// `repo`'s published releases, newest first, for choosing a version.
     fn versions(&self, _repo: &str) -> Result<Vec<Release>, String> {
         Err("version list isn't available here".into())
     }
+    /// The release `track` follows: the latest stable one, or the chosen nightly or exact version
+    /// from [`versions`](Self::versions), with no fallback to another.
     fn chosen(&self, repo: &str, track: &artcraft_launcher_core::protocol::VersionTrack) -> Answer {
-        match track {
-            artcraft_launcher_core::protocol::VersionTrack::Stable => self.latest(repo, false),
-            _ => Answer { latest: LatestRelease::Failed("version choices aren't available here".into()), source: Source::Cache },
+        if *track == artcraft_launcher_core::protocol::VersionTrack::Stable {
+            return self.latest(repo, false);
         }
+        let latest = match self.versions(repo) {
+            Ok(list) => release::choose_version(&list, track).map_or(LatestRelease::None, LatestRelease::Found),
+            Err(why) => LatestRelease::Failed(why),
+        };
+        Answer { latest, source: Source::GitHubApi }
     }
     /// The last answer saved for `repo`, for an instant first paint.
     fn cached(&self, repo: &str, prereleases: bool) -> Option<LatestRelease>;
@@ -170,18 +177,6 @@ impl ReleaseSource for GitHubSource {
         };
         self.versions_cache.lock().unwrap_or_else(PoisonError::into_inner).insert(repo.to_string(), (crate::now(), list.clone()));
         Ok(list)
-    }
-
-    fn chosen(&self, repo: &str, track: &artcraft_launcher_core::protocol::VersionTrack) -> Answer {
-        use artcraft_launcher_core::protocol::VersionTrack;
-        if *track == VersionTrack::Stable {
-            return self.latest(repo, false);
-        }
-        let latest = match self.versions(repo) {
-            Ok(list) => release::choose_version(&list, track).map_or(LatestRelease::None, LatestRelease::Found),
-            Err(why) => LatestRelease::Failed(why),
-        };
-        Answer { latest, source: Source::GitHubApi }
     }
 
     fn latest(&self, repo: &str, prereleases: bool) -> Answer {

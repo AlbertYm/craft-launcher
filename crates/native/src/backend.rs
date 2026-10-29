@@ -325,6 +325,7 @@ impl NativeBackend {
         let http = self.http.clone();
         let platform = self.platform;
         let options = self.options();
+        let source = self.source.clone();
         std::thread::spawn(move || {
             let job = job;
             let existing = shared.installed.lock().unwrap_or_else(PoisonError::into_inner).get(app.id).cloned();
@@ -354,6 +355,7 @@ impl NativeBackend {
                     record.as_ref(),
                     &stop,
                     work == Work::Replace,
+                    source.as_deref(),
                 );
                 // Stopped by the connection rather than by the user: say so, and how to go on.
                 match r {
@@ -462,6 +464,28 @@ fn release_matches_track(release: &Release, track: &VersionTrack, prereleases: b
     }
 }
 
+/// For a version chosen by name that is older than the installed copy: the installed version's own
+/// published release, to put back if the downgrade fails. `None` for anything else, without
+/// asking `list`. An error means the downgrade can't be made safe, so it must not start.
+fn downgrade_previous(
+    app: &CraftApp,
+    track: &VersionTrack,
+    chosen: &Release,
+    existing: Option<&Installed>,
+    list: impl FnOnce() -> Result<Vec<Release>, String>,
+) -> Result<Option<Release>, String> {
+    let VersionTrack::Pinned(tag) = track else { return Ok(None) };
+    let (Some(chosen_v), Some(installed_v)) = (chosen.version.as_ref(), existing.and_then(|i| i.version.as_ref())) else { return Ok(None) };
+    if chosen.tag != *tag || !version::is_newer(installed_v, chosen_v) {
+        return Ok(None);
+    }
+    let releases =
+        list().map_err(|e| format!("couldn't find {} {installed_v} to put back if going back fails ({e}), so nothing was changed.", app.name))?;
+    releases.into_iter().find(|r| r.version.as_ref() == Some(installed_v)).map(Some).ok_or_else(|| {
+        format!("{} {installed_v} isn't published any more, so it couldn't be put back if going back fails. Nothing was changed.", app.name)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_install(
     app: &CraftApp,
@@ -474,6 +498,7 @@ fn run_install(
     record: Option<&crate::manifest::Record>,
     stop: &Stop,
     replace: bool,
+    source: Option<&dyn ReleaseSource>,
 ) -> Result<String, String> {
     if let Some(msg) = existing.and_then(|e| install::managed_elsewhere(app, e, false)) {
         return Err(msg);
@@ -502,6 +527,21 @@ fn run_install(
             format!("{} {} has no download for {}", app.name, release.version_label(), platform.label())
         }
     })?;
+    // Going back to a version chosen by name: the installed version's own package is found first,
+    // so a downgrade that fails can put it back. Without it nothing changes.
+    let previous = downgrade_previous(app, track, &release, existing, || {
+        source.ok_or_else(|| "secure connections aren't available on this system".to_string())?.versions(&feed_repo(load_feed(paths).as_ref(), app))
+    })?;
+    let previous_asset = match &previous {
+        Some(p) => Some(
+            planned_asset(app, p, platform, options, existing, record)
+                .filter(|(_, k)| *k == kind)
+                .map(|(a, _)| a)
+                .ok_or_else(|| format!("{} {} has no matching download to put back, so nothing was changed.", app.name, p.version_label()))?,
+        ),
+        None => None,
+    };
+    let downgrade = previous.as_ref().zip(previous_asset.as_ref()).map(|(previous, asset)| install::Downgrade { previous, asset });
     if !replace && let Some(path) = install::occupied(app, &asset, kind, existing, record, &options.install_locations, paths)? {
         shared.emit(Event::Occupied { app: app.id.to_string(), path: path.display().to_string() });
         return Err(format!("{} already exists", path.display()));
@@ -515,7 +555,7 @@ fn run_install(
         last_emit = Instant::now();
         shared.emit(Event::Progress { app: app.id.to_string(), phase: p });
     };
-    let mut job = Job { http, paths, stop, phase: &mut phase, install_locations: &options.install_locations, replace };
+    let mut job = Job { http, paths, stop, phase: &mut phase, install_locations: &options.install_locations, replace, downgrade };
     let mut commit_record = |record: &crate::manifest::Record| {
         let mut manifest = shared.manifest.lock().unwrap_or_else(PoisonError::into_inner);
         let mut updated = manifest.clone();
@@ -1180,6 +1220,77 @@ mod tests {
     use super::*;
 
     use crate::source::Answer;
+
+    fn tagged(v: &str) -> Release {
+        Release { tag: format!("v{v}"), version: version::parse(v), ..Default::default() }
+    }
+
+    #[test]
+    fn only_a_version_chosen_by_name_below_the_installed_one_looks_for_a_package_to_put_back() {
+        let app = CraftApp::by_id("filmcraft").unwrap();
+        let installed = Installed { version: version::parse("0.14.0"), source: InstallSource::Msi, location: String::new(), package: None };
+        let pinned = VersionTrack::Pinned("v0.13.0".into());
+        let never = || -> Result<Vec<Release>, String> { panic!("no list is needed") };
+        // An update, the latest release, nothing installed, or a stale release: no downgrade.
+        assert_eq!(downgrade_previous(app, &VersionTrack::Stable, &tagged("0.13.0"), Some(&installed), never), Ok(None));
+        assert_eq!(downgrade_previous(app, &VersionTrack::Pinned("v0.15.0".into()), &tagged("0.15.0"), Some(&installed), never), Ok(None));
+        assert_eq!(downgrade_previous(app, &pinned, &tagged("0.13.0"), None, never), Ok(None));
+        assert_eq!(downgrade_previous(app, &pinned, &tagged("0.12.0"), Some(&installed), never), Ok(None));
+        // Going back finds the installed version's own release.
+        let found = downgrade_previous(app, &pinned, &tagged("0.13.0"), Some(&installed), || Ok(vec![tagged("0.14.0"), tagged("0.13.0")]));
+        assert_eq!(found.unwrap().map(|r| r.tag), Some("v0.14.0".to_string()));
+        // Without it, or without the list, the downgrade doesn't start.
+        let gone = downgrade_previous(app, &pinned, &tagged("0.13.0"), Some(&installed), || Ok(vec![tagged("0.13.0")])).unwrap_err();
+        assert!(gone.contains("FilmCraft 0.14.0 isn't published any more") && gone.contains("Nothing was changed"), "{gone}");
+        let offline = downgrade_previous(app, &pinned, &tagged("0.13.0"), Some(&installed), || Err("offline".into())).unwrap_err();
+        assert!(offline.contains("(offline)") && offline.contains("nothing was changed"), "{offline}");
+    }
+
+    /// Going back is a conscious choice: a check for a pinned app reports the pinned release, so
+    /// a newer one never shows as an update (badge, Update all, notification or automatic install).
+    #[test]
+    fn a_pinned_app_is_never_offered_a_newer_release() {
+        struct Published;
+        impl ReleaseSource for Published {
+            fn latest(&self, repo: &str, _prereleases: bool) -> crate::source::Answer {
+                let found = CraftApp::by_id(APP).is_some_and(|a| a.repo == repo);
+                let latest = if found { LatestRelease::Found(tagged("0.6.0")) } else { LatestRelease::None };
+                crate::source::Answer { latest, source: Source::GitHubApi }
+            }
+            fn versions(&self, _repo: &str) -> Result<Vec<Release>, String> {
+                Ok(vec![tagged("0.6.0"), tagged("0.5.0")])
+            }
+            fn cached(&self, _repo: &str, _prereleases: bool) -> Option<LatestRelease> {
+                None
+            }
+            fn rate_limited_until(&self) -> Option<i64> {
+                None
+            }
+            fn save(&self) {}
+        }
+        let Some(platform) = native_platform() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = backend(dir.path(), platform, Some(Arc::new(Published)));
+        backend.http = Some(Http::new().unwrap());
+        {
+            let mut options = backend.shared.options.lock().unwrap();
+            options.prereleases = true; // asks the source directly, never ArtCraft's API
+            options.versions.insert(APP.to_string(), VersionTrack::Pinned("v0.5.0".into()));
+        }
+        backend.send(Command::CheckForUpdates { force: true });
+        let mut events = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !events.iter().any(|e| matches!(e, Event::CheckFinished { .. })) {
+            assert!(Instant::now() < deadline, "the check never finished");
+            std::thread::sleep(Duration::from_millis(10));
+            events.extend(backend.poll());
+        }
+        let answered = events.iter().rev().find_map(|e| match e {
+            Event::Latest { app, latest: LatestRelease::Found(r), .. } if app == APP => Some(r.tag.clone()),
+            _ => None,
+        });
+        assert_eq!(answered.as_deref(), Some("v0.5.0"), "the pinned release, not the newer one");
+    }
 
     #[test]
     fn an_install_cannot_use_a_stale_release_from_a_different_track() {

@@ -42,6 +42,16 @@ pub struct Job<'a> {
     pub install_locations: &'a InstallLocations,
     /// Write over whatever [`occupied`] found.
     pub replace: bool,
+    /// Set only when the person chose this older version by name over a newer installed copy.
+    pub downgrade: Option<Downgrade<'a>>,
+}
+
+/// The installed version's own release and package, downloaded and checked before a downgrade
+/// changes anything, so a failed downgrade can put it back.
+#[derive(Clone, Copy)]
+pub struct Downgrade<'a> {
+    pub previous: &'a Release,
+    pub asset: &'a Asset,
 }
 
 /// Downloads and installs `asset` of `release`. Returns a record when the launcher owns the
@@ -87,12 +97,18 @@ pub fn install_at(
         return Err(format!("{} is running. Quit it, then try again.", app.name));
     }
     bind_artifact_version(app, release, asset)?;
+    // A feed can't send an app back to an older build; only a version the person chose by name
+    // (a downgrade with the installed version's package to put back) gets past this.
     if !job.replace
+        && job.downgrade.is_none()
         && let Some(inst) = existing
         && let (Some(rel_v), Some(inst_v)) = (release.version.as_ref(), inst.version.as_ref())
         && version::is_newer(inst_v, rel_v)
     {
         return Err(format!("Cannot update {} to {}: installed version {} is newer", app.name, release.version_label(), inst_v));
+    }
+    if job.downgrade.is_some() && !(kind == PackageKind::Msi && existing.is_some_and(|inst| inst.source == InstallSource::Msi)) {
+        return Err(format!("Going back to an older version of {} isn't available for this kind of install yet.", app.name));
     }
     log::info!("{}: starting {} to {} ({})", app.name, if existing.is_some() { "update" } else { "install" }, release.version_label(), kind.label());
     // An update of an installed MSI may be an all-users one. Say so before the (slow) scope lookup, so
@@ -113,9 +129,16 @@ pub fn install_at(
         None
     };
     #[cfg(windows)]
-    if msi_scope != Some(MsiScope::PerMachine) {
+    if msi_scope != Some(MsiScope::PerMachine) || job.downgrade.is_some() {
+        // A downgrade runs its own remove, install and put-back steps, outside any batch.
         joined = None;
     }
+    // The package to put back comes first: without it, nothing is removed.
+    #[cfg_attr(not(windows), allow(unused_variables))]
+    let rollback = match job.downgrade {
+        Some(d) => Some((download(d.previous, d.asset, job)?.0, d.previous.version_label())),
+        None => None,
+    };
     // The checksum is kept for the Windows all-users route, which checks the held package again.
     #[cfg_attr(not(windows), allow(unused_variables))]
     let (file, sha256) = download(release, asset, job)?;
@@ -135,10 +158,19 @@ pub fn install_at(
             // An update lands in the same Windows Installer context as the copy being replaced:
             // per-machine needs elevation, per-user must not duplicate itself per-machine. A
             // fresh install passes no context and takes the package's own default.
-            match &joined {
+            match (&joined, &rollback) {
+                (_, Some((previous, previous_version))) => windows::downgrade_msi(
+                    app,
+                    (file.as_path(), version.as_str()),
+                    (previous.as_path(), previous_version.as_str()),
+                    destination.as_deref(),
+                    msi_scope,
+                    job.stop,
+                    &mut *job.phase,
+                ),
                 // All-users updates that are ready together share one permission prompt.
-                Some(joined) => windows::run_msi_all_users(&file, &sha256, destination.as_deref(), joined, job.stop, &mut *job.phase),
-                None => windows::run_msi(&file, destination.as_deref(), msi_scope, job.stop, &mut *job.phase),
+                (Some(joined), None) => windows::run_msi_all_users(&file, &sha256, destination.as_deref(), joined, job.stop, &mut *job.phase),
+                (None, None) => windows::run_msi(&file, destination.as_deref(), msi_scope, job.stop, &mut *job.phase),
             }
             .map(|_| None)
         }
@@ -186,6 +218,9 @@ pub fn install_at(
     // again and skips the transfer.
     if result.is_ok() {
         let _ = std::fs::remove_file(&file);
+        if let Some((previous, _)) = &rollback {
+            let _ = std::fs::remove_file(previous);
+        }
     }
     // The system's own prompt was dismissed: the download itself wasn't cancelled.
     result.map_err(|e| if e == CANCELLED { INSTALL_CANCELLED.to_string() } else { e })
@@ -1845,6 +1880,10 @@ fn explain(code: Option<i32>) -> Result<(), String> {
 #[cfg(any(windows, test))]
 mod msi_batch;
 
+/// Going back to an older version of a Windows Installer app.
+#[cfg(any(windows, test))]
+mod msi_downgrade;
+
 /// Builds the Windows Installer command separately so its package argument can be checked
 /// without starting an installer.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -1880,8 +1919,8 @@ pub mod windows {
     use artcraft_launcher_core::protocol::CANCELLED;
 
     use super::{
-        CraftApp, INSTALLER, JobPhase, MsiScope, Path, PathBuf, Stop, cancelled, explain, msi_batch, msi_command, msi_folder_argument, msi_log,
-        msi_scope_arguments, process, turn,
+        CraftApp, INSTALLER, JobPhase, MsiScope, Path, PathBuf, Stop, cancelled, explain, msi_batch, msi_command, msi_downgrade, msi_folder_argument,
+        msi_log, msi_scope_arguments, process, turn,
     };
 
     fn msiexec() -> PathBuf {
@@ -1977,6 +2016,29 @@ pub mod windows {
     /// stop with error 1618). Cancelled while it waits, it never runs.
     fn in_turn(stop: &Stop, phase: &mut dyn FnMut(JobPhase), working: JobPhase, work: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
         INSTALLER.alone(&cancelled(stop), &mut turn(phase, working), work).unwrap_or_else(|| Err(CANCELLED.into()))
+    }
+
+    /// Goes back to `chosen` (its package and version) from a newer installed copy, which the app
+    /// packages won't install over: removes it, installs `chosen` in the same folder and context,
+    /// and puts `previous` back from its package if that does not finish (see [`msi_downgrade`]).
+    pub(super) fn downgrade_msi(
+        app: &CraftApp,
+        chosen: (&Path, &str),
+        previous: (&Path, &str),
+        destination: Option<&Path>,
+        scope: Option<MsiScope>,
+        stop: &Stop,
+        phase: &mut dyn FnMut(JobPhase),
+    ) -> Result<(), String> {
+        let phase = std::cell::RefCell::new(phase);
+        msi_downgrade::run(msi_downgrade::Steps {
+            app: app.name,
+            chosen: chosen.1,
+            previous: previous.1,
+            remove: &mut || uninstall_msi(app, stop, &mut **phase.borrow_mut()),
+            install_chosen: &mut || run_msi(chosen.0, destination, scope, stop, &mut **phase.borrow_mut()),
+            reinstall_previous: &mut || run_msi(previous.0, destination, scope, stop, &mut **phase.borrow_mut()),
+        })
     }
 
     pub fn uninstall_msi(app: &CraftApp, stop: &Stop, phase: &mut dyn FnMut(JobPhase)) -> Result<(), String> {
@@ -2366,6 +2428,49 @@ mod tests {
         assert_eq!(std::fs::read(&staged).unwrap(), b"updated app");
     }
 
+    /// Going back is only built for an MSI over an MSI install; anything else refuses before a
+    /// byte is downloaded, rather than running a downgrade with no way to put the old copy back.
+    #[cfg(windows)]
+    #[test]
+    fn a_downgrade_refuses_anything_but_an_msi_over_an_msi_install() {
+        let app = CraftApp::by_id("photocraft").unwrap();
+        let tagged = |v: &str| Release { tag: format!("v{v}"), version: version::parse(v), ..Release::default() };
+        let msi = |v: &str| Asset {
+            name: format!("photocraft-{v}-windows-x64.msi"),
+            size: 3,
+            url: format!("https://example.invalid/photocraft-{v}-windows-x64.msi"),
+            sha256: None,
+        };
+        let (older, newer, older_msi, newer_msi) = (tagged("0.4.0"), tagged("0.5.0"), msi("0.4.0"), msi("0.5.0"));
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let http = Http::new().unwrap();
+        let locations = InstallLocations::default();
+        let portable = Installed {
+            version: version::parse("0.5.0"),
+            source: InstallSource::Launcher,
+            location: dir.path().join("photocraft.exe").display().to_string(),
+            package: None,
+        };
+        let mut phases = vec![];
+        let error = {
+            let mut phase = |p| phases.push(p);
+            let mut job = Job {
+                http: &http,
+                paths: &paths,
+                stop: &Stop::default(),
+                phase: &mut phase,
+                install_locations: &locations,
+                replace: false,
+                downgrade: Some(Downgrade { previous: &newer, asset: &newer_msi }),
+            };
+            install(app, &older, &older_msi, PackageKind::Msi, Some(&portable), None, &mut job).unwrap_err()
+        };
+        assert!(error.contains("isn't available for this kind of install"), "{error}");
+        assert!(phases.is_empty(), "nothing started");
+        assert!(!paths.downloads().exists(), "nothing was downloaded");
+    }
+
     #[test]
     fn a_failed_install_keeps_the_download_for_the_next_try() {
         use crate::http::tests::{Reply, body, serve};
@@ -2389,6 +2494,7 @@ mod tests {
                 phase: &mut phase,
                 install_locations: &InstallLocations::default(),
                 replace: false,
+                downgrade: None,
             };
             let err = install(app, &release, &asset, kind, None, None, &mut job).unwrap_err();
             assert!(err.contains("isn't supported"), "{err}");
@@ -2413,7 +2519,15 @@ mod tests {
         let http = Http::new().unwrap();
         let mut phases = vec![];
         let mut phase = |p| phases.push(p);
-        let mut job = Job { http: &http, paths: &paths, stop: &Stop::default(), phase: &mut phase, install_locations: &locations, replace: false };
+        let mut job = Job {
+            http: &http,
+            paths: &paths,
+            stop: &Stop::default(),
+            phase: &mut phase,
+            install_locations: &locations,
+            replace: false,
+            downgrade: None,
+        };
         let error = install(app, &release, &asset, PackageKind::AppImage, None, None, &mut job).unwrap_err();
         assert!(error.contains("folder is unavailable") || (process::in_sandbox() && error.contains("aren't supported")), "{error}");
         assert!(requests.lock().unwrap().is_empty());
@@ -2443,6 +2557,7 @@ mod tests {
             phase: &mut phase,
             install_locations: &InstallLocations::default(),
             replace: false,
+            downgrade: None,
         };
         let err = install(app, &release, &asset, kind, None, None, &mut job).unwrap_err();
         assert!(err.contains("publishes no checksum"), "{err}");
@@ -2955,7 +3070,7 @@ mod tests {
             package: None,
         };
         let stop = Stop::default();
-        let mut job = Job { http: &http, paths: &paths, stop: &stop, phase, install_locations: &locations, replace: false };
+        let mut job = Job { http: &http, paths: &paths, stop: &stop, phase, install_locations: &locations, replace: false, downgrade: None };
         let result = install_at(app, &release, &asset, PackageKind::AppImage, Some(&installed), None, &mut job, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("installed version 0.5.0 is newer"));
@@ -2978,7 +3093,7 @@ mod tests {
             ..Asset::default()
         };
         let stop = Stop::default();
-        let mut job = Job { http: &http, paths: &paths, stop: &stop, phase, install_locations: &locations, replace: false };
+        let mut job = Job { http: &http, paths: &paths, stop: &stop, phase, install_locations: &locations, replace: false, downgrade: None };
         let result = install_at(app, &release, &asset, PackageKind::AppImage, None, None, &mut job, None);
         assert!(result.is_err(), "mismatched artifact version must be rejected");
         assert!(result.unwrap_err().contains("does not match the advertised version"));
