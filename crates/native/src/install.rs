@@ -136,7 +136,10 @@ pub fn install_at(
     // The package to put back comes first: without it, nothing is removed.
     #[cfg_attr(not(windows), allow(unused_variables))]
     let rollback = match job.downgrade {
-        Some(d) => Some((download(d.previous, d.asset, job)?.0, d.previous.version_label())),
+        Some(d) => {
+            let (file, sha256) = download(d.previous, d.asset, job)?;
+            Some((file, sha256, d.previous.version_label()))
+        }
         None => None,
     };
     // The checksum is kept for the Windows all-users route, which checks the held package again.
@@ -159,10 +162,10 @@ pub fn install_at(
             // per-machine needs elevation, per-user must not duplicate itself per-machine. A
             // fresh install passes no context and takes the package's own default.
             match (&joined, &rollback) {
-                (_, Some((previous, previous_version))) => windows::downgrade_msi(
+                (_, Some((previous, previous_sha256, previous_version))) => windows::downgrade_msi(
                     app,
-                    (file.as_path(), version.as_str()),
-                    (previous.as_path(), previous_version.as_str()),
+                    windows::Package { file: &file, sha256: &sha256, version: &version },
+                    windows::Package { file: previous, sha256: previous_sha256, version: previous_version },
                     destination.as_deref(),
                     msi_scope,
                     job.stop,
@@ -218,7 +221,7 @@ pub fn install_at(
     // again and skips the transfer.
     if result.is_ok() {
         let _ = std::fs::remove_file(&file);
-        if let Some((previous, _)) = &rollback {
+        if let Some((previous, ..)) = &rollback {
             let _ = std::fs::remove_file(previous);
         }
     }
@@ -2021,24 +2024,85 @@ pub mod windows {
     /// Goes back to `chosen` (its package and version) from a newer installed copy, which the app
     /// packages won't install over: removes it, installs `chosen` in the same folder and context,
     /// and puts `previous` back from its package if that does not finish (see [`msi_downgrade`]).
+    /// A downloaded package checked against its release checksum, and its version.
+    pub(super) struct Package<'a> {
+        pub file: &'a Path,
+        pub sha256: &'a str,
+        pub version: &'a str,
+    }
+
+    /// Goes back to `chosen` from a newer installed copy, which the app packages won't install
+    /// over: removes it, installs `chosen` in the same folder and context, and puts `previous`
+    /// back if that does not finish (see [`msi_downgrade`]). An all-users copy does all three
+    /// under one permission prompt; a per-user copy needs none, and runs them one by one.
     pub(super) fn downgrade_msi(
         app: &CraftApp,
-        chosen: (&Path, &str),
-        previous: (&Path, &str),
+        chosen: Package<'_>,
+        previous: Package<'_>,
         destination: Option<&Path>,
         scope: Option<MsiScope>,
         stop: &Stop,
         phase: &mut dyn FnMut(JobPhase),
     ) -> Result<(), String> {
+        if scope == Some(MsiScope::PerMachine) {
+            let mut elevated = None;
+            in_turn(stop, phase, JobPhase::Installing, || {
+                elevated = downgrade_elevated(app, &chosen, &previous, destination, scope)?;
+                Ok(())
+            })?;
+            if let Some(ended) = elevated {
+                return msi_downgrade::report(ended, app.name, chosen.version, previous.version);
+            }
+            log::warn!("{}: couldn't start the elevated session; going back one step at a time", app.name);
+        }
         let phase = std::cell::RefCell::new(phase);
         msi_downgrade::run(msi_downgrade::Steps {
             app: app.name,
-            chosen: chosen.1,
-            previous: previous.1,
+            chosen: chosen.version,
+            previous: previous.version,
             remove: &mut || uninstall_msi(app, stop, &mut **phase.borrow_mut()),
-            install_chosen: &mut || run_msi(chosen.0, destination, scope, stop, &mut **phase.borrow_mut()),
-            reinstall_previous: &mut || run_msi(previous.0, destination, scope, stop, &mut **phase.borrow_mut()),
+            install_chosen: &mut || run_msi(chosen.file, destination, scope, stop, &mut **phase.borrow_mut()),
+            reinstall_previous: &mut || run_msi(previous.file, destination, scope, stop, &mut **phase.borrow_mut()),
         })
+    }
+
+    /// The one-prompt route: both packages held unchanged and checked again, then one elevated
+    /// session removes, installs and if needed puts back. `None` when that session can't start.
+    fn downgrade_elevated(
+        app: &CraftApp,
+        chosen: &Package<'_>,
+        previous: &Package<'_>,
+        destination: Option<&Path>,
+        scope: Option<MsiScope>,
+    ) -> Result<Option<msi_downgrade::Ended>, String> {
+        let _held = (msi_batch::hold(chosen.file, chosen.sha256)?, msi_batch::hold(previous.file, previous.sha256)?);
+        let installs = crate::detect::windows::msi_installs(app);
+        if installs.is_empty() {
+            return Err(format!("{} isn't registered with the Windows Installer", app.name));
+        }
+        let removals = installs.iter().map(|m| msi_downgrade::removal(&m.product_code)).collect::<Result<Vec<_>, _>>()?;
+        let script = msi_downgrade::script(
+            msi_batch::text(&msiexec())?,
+            &removals,
+            &msi_batch::line(chosen.file, destination, scope)?,
+            &msi_batch::line(previous.file, destination, scope)?,
+        );
+        let root =
+            std::env::var_os("SystemRoot").map(PathBuf::from).filter(|root| root.is_absolute()).ok_or("SystemRoot is not set to an absolute path")?;
+        let powershell = root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        let mut command = process::command(&powershell);
+        command
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(msi_batch::outer_script(msi_batch::text(&powershell)?, &msi_batch::encoded(&script)));
+        log::info!("{}: going back to {} under one permission prompt", app.name, chosen.version);
+        let ended = match command.status() {
+            Ok(status) => msi_downgrade::ended(status.code()),
+            Err(e) => {
+                log::warn!("couldn't start PowerShell ({e})");
+                msi_downgrade::Ended::LaunchFailed
+            }
+        };
+        Ok((ended != msi_downgrade::Ended::LaunchFailed).then_some(ended))
     }
 
     pub fn uninstall_msi(app: &CraftApp, stop: &Stop, phase: &mut dyn FnMut(JobPhase)) -> Result<(), String> {

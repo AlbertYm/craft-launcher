@@ -4,19 +4,27 @@
 //! version of … is already installed"), so the older version only goes in once the newer one is
 //! gone. The person asked for this version by name; going back is never offered on its own.
 //!
-//! Order, and what each failure leaves behind:
-//! 1. Before anything changes, both packages are downloaded and checked against their published
-//!    checksums: the chosen one, and the installed version's own, to put back.
-//! 2. The installed copy is removed. If that fails, nothing has changed.
-//! 3. The chosen version is installed in the same folder and context. If that fails, or the
-//!    permission prompt is refused, the installed version goes back in from its package.
+//! Before anything changes, both packages are downloaded and checked against their published
+//! checksums: the chosen one, and the installed version's own, to put back. Then:
+//! 1. The installed copy is removed. If that fails, nothing has changed.
+//! 2. The chosen version is installed in the same folder and context. If that fails, the
+//!    installed version goes back in from its package.
 //!
-//! Only the order and the messages live here, so they are tested on every OS; the Windows
-//! Installer calls are handed in.
+//! An all-users copy needs Windows' permission, and the three steps run under ONE prompt, in one
+//! elevated session ([`script`]). Saying no changes nothing, and once it is yes, putting the old
+//! version back needs no second answer. Separate prompts proved fragile: they look identical, so
+//! a refused install was followed by a refused put-back, read as a retry, leaving no app at all.
+//! The session is given only `msiexec` command lines for the two held, checked packages and the
+//! installed copy's product codes, as [`msi_batch`](super::msi_batch) does for Update all.
+//!
+//! A per-user copy needs no permission, so its steps run one after another ([`run`]); that is
+//! also the fallback when the elevated session cannot start.
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use artcraft_launcher_core::protocol::CANCELLED;
+
+use super::msi_batch::{self, DECLINED, LAUNCH_FAILED};
 
 /// The three Windows Installer steps of a downgrade, and the names the messages use.
 pub(super) struct Steps<'a> {
@@ -30,7 +38,7 @@ pub(super) struct Steps<'a> {
 }
 
 /// Removes the installed copy, installs the chosen version, and puts the previous one back if
-/// that install does not finish.
+/// that install does not finish, one step after another.
 pub(super) fn run(steps: Steps<'_>) -> Result<(), String> {
     let Steps { app, chosen, previous, remove, install_chosen, reinstall_previous } = steps;
     remove()?;
@@ -39,12 +47,17 @@ pub(super) fn run(steps: Steps<'_>) -> Result<(), String> {
         Err(e) => reason(&e),
     };
     match reinstall_previous() {
-        Ok(()) => Err(format!("{app} {chosen} couldn't be installed ({why}). {app} {previous} was put back.")),
-        Err(again) => Err(format!(
-            "{app} {chosen} couldn't be installed ({why}), and putting {previous} back failed too ({}). Install {app} again from the launcher.",
-            reason(&again)
-        )),
+        Ok(()) => Err(put_back(app, chosen, previous, &why)),
+        Err(again) => Err(not_put_back(app, chosen, previous, &why, &reason(&again))),
     }
+}
+
+fn put_back(app: &str, chosen: &str, previous: &str, why: &str) -> String {
+    format!("{app} {chosen} couldn't be installed ({why}). {app} {previous} was put back.")
+}
+
+fn not_put_back(app: &str, chosen: &str, previous: &str, why: &str, again: &str) -> String {
+    format!("{app} {chosen} couldn't be installed ({why}), and putting {previous} back failed too ({again}). Install {app} again from the launcher.")
 }
 
 /// A refused permission prompt reads as what happened, not as the cancel code.
@@ -52,73 +65,110 @@ fn reason(error: &str) -> String {
     if error == CANCELLED { "permission wasn't given".to_string() } else { error.to_string() }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::cell::RefCell;
+/// The step that stopped the elevated session, in its exit code: bit 29 (the "customer" bit, which
+/// no Windows or Windows Installer code sets), the step in bits 24-27, and the `msiexec` codes in
+/// bits 12-23 and 0-11. Windows Installer codes are below 4096.
+const OURS: i32 = 0x2000_0000;
+const REMOVAL_FAILED: i32 = 1;
+const PUT_BACK: i32 = 2;
+const NOT_PUT_BACK: i32 = 3;
 
-    use super::*;
+/// The elevated session: removes each installed registration (`remove`, `msiexec` arguments),
+/// installs `chosen`, and on failure installs `previous`, all through `program`. It exits 0 when
+/// the chosen version went in, or with one of the codes [`ended`] reads.
+pub(super) fn script(program: &str, remove: &[String], chosen: &str, previous: &str) -> String {
+    let list = remove.iter().map(|l| msi_batch::quoted(l)).collect::<Vec<_>>().join(",");
+    format!(
+        "$ErrorActionPreference = 'Stop'\n\
+         $ProgressPreference = 'SilentlyContinue'\n\
+         $program = {program}\n\
+         function Run([string]$arguments) {{ (Start-Process -FilePath $program -ArgumentList $arguments -Wait -PassThru).ExitCode }}\n\
+         function Fine([int]$code) {{ $code -eq 0 -or $code -eq 3010 -or $code -eq 1641 }}\n\
+         function Code([int]$code) {{ if ($code -lt 0 -or $code -gt 4094) {{ 4095 }} else {{ $code }} }}\n\
+         function Ended([int]$step, [int]$first, [int]$second) {{ {OURS} -bor ($step -shl 24) -bor ((Code $first) -shl 12) -bor (Code $second) }}\n\
+         foreach ($arguments in @({list})) {{\n\
+         \x20 $code = Run $arguments\n\
+         \x20 if (-not (Fine $code)) {{ exit (Ended {REMOVAL_FAILED} $code 0) }}\n\
+         }}\n\
+         $code = Run {chosen}\n\
+         if (Fine $code) {{ exit 0 }}\n\
+         $back = Run {previous}\n\
+         if (Fine $back) {{ exit (Ended {PUT_BACK} $code 0) }}\n\
+         exit (Ended {NOT_PUT_BACK} $code $back)\n",
+        program = msi_batch::quoted(program),
+        chosen = msi_batch::quoted(chosen),
+        previous = msi_batch::quoted(previous),
+    )
+}
 
-    /// Runs a downgrade whose steps answer `remove`, `chosen` and `back`, and returns its result
-    /// with the steps that ran, in order.
-    fn downgrade(remove: Result<(), &str>, chosen: Result<(), &str>, back: Result<(), &str>) -> (Result<(), String>, Vec<&'static str>) {
-        let ran = RefCell::new(Vec::new());
-        let result = run(Steps {
-            app: "FilmCraft",
-            chosen: "0.13.0",
-            previous: "0.14.0",
-            remove: &mut || {
-                ran.borrow_mut().push("remove");
-                remove.map_err(str::to_string)
-            },
-            install_chosen: &mut || {
-                ran.borrow_mut().push("install chosen");
-                chosen.map_err(str::to_string)
-            },
-            reinstall_previous: &mut || {
-                ran.borrow_mut().push("put back");
-                back.map_err(str::to_string)
-            },
-        });
-        (result, ran.into_inner())
-    }
+/// What the elevated session's exit code says happened.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Ended {
+    Done,
+    /// The one prompt was refused: nothing ran.
+    Declined,
+    /// The session never started; the per-user route can still be tried.
+    LaunchFailed,
+    RemovalFailed(i32),
+    /// The chosen version failed with this code, and the previous one is back.
+    PutBack(i32),
+    NotPutBack {
+        install: i32,
+        back: i32,
+    },
+    Other(Option<i32>),
+}
 
-    #[test]
-    fn the_newer_copy_goes_before_the_chosen_version_and_nothing_is_put_back_on_success() {
-        let (result, ran) = downgrade(Ok(()), Ok(()), Ok(()));
-        assert_eq!(result, Ok(()));
-        assert_eq!(ran, ["remove", "install chosen"]);
-    }
-
-    #[test]
-    fn a_failed_removal_changes_nothing_and_installs_nothing() {
-        let (result, ran) = downgrade(Err("the Windows Installer stopped with error 1603"), Ok(()), Ok(()));
-        assert_eq!(result, Err("the Windows Installer stopped with error 1603".to_string()));
-        assert_eq!(ran, ["remove"]);
-    }
-
-    #[test]
-    fn a_failed_install_puts_the_previous_version_back_and_says_so() {
-        let (result, ran) = downgrade(Ok(()), Err("the Windows Installer stopped with error 1603"), Ok(()));
-        assert_eq!(ran, ["remove", "install chosen", "put back"]);
-        let message = result.unwrap_err();
-        assert!(message.contains("FilmCraft 0.13.0 couldn't be installed"), "{message}");
-        assert!(message.contains("FilmCraft 0.14.0 was put back"), "{message}");
-    }
-
-    #[test]
-    fn a_refused_prompt_also_puts_the_previous_version_back() {
-        let (result, ran) = downgrade(Ok(()), Err(CANCELLED), Ok(()));
-        assert_eq!(ran, ["remove", "install chosen", "put back"]);
-        let message = result.unwrap_err();
-        assert!(message.contains("permission wasn't given"), "{message}");
-        assert!(!message.contains(CANCELLED), "{message}");
-    }
-
-    #[test]
-    fn when_putting_back_fails_too_the_person_is_told_how_to_recover() {
-        let (result, _) = downgrade(Ok(()), Err("error 1603"), Err(CANCELLED));
-        let message = result.unwrap_err();
-        assert!(message.contains("putting 0.14.0 back failed too (permission wasn't given)"), "{message}");
-        assert!(message.contains("Install FilmCraft again from the launcher"), "{message}");
+pub(super) fn ended(code: Option<i32>) -> Ended {
+    let Some(code) = code else { return Ended::Other(None) };
+    let step = (code >> 24) & 0xF;
+    let (first, second) = ((code >> 12) & 0xFFF, code & 0xFFF);
+    match code {
+        0 => Ended::Done,
+        DECLINED => Ended::Declined,
+        LAUNCH_FAILED => Ended::LaunchFailed,
+        _ if code & !0x0FFF_FFFF == OURS && step == REMOVAL_FAILED => Ended::RemovalFailed(first),
+        _ if code & !0x0FFF_FFFF == OURS && step == PUT_BACK => Ended::PutBack(first),
+        _ if code & !0x0FFF_FFFF == OURS && step == NOT_PUT_BACK => Ended::NotPutBack { install: first, back: second },
+        _ => Ended::Other(Some(code)),
     }
 }
+
+/// What a finished elevated downgrade means for the person. `LaunchFailed` is not passed here:
+/// the caller falls back to [`run`] instead.
+pub(super) fn report(ended: Ended, app: &str, chosen: &str, previous: &str) -> Result<(), String> {
+    // Inside the session permission was already given: a cancel there is the progress window's.
+    let msiexec = |code: i32| match super::explain(Some(code)).err().unwrap_or_default() {
+        e if e == CANCELLED => "it was cancelled".to_string(),
+        e => e,
+    };
+    match ended {
+        Ended::Done => Ok(()),
+        Ended::Declined => Err(CANCELLED.to_string()),
+        Ended::RemovalFailed(code) => Err(format!("{app} {previous} couldn't be removed ({}), so nothing was changed.", msiexec(code))),
+        Ended::PutBack(code) => Err(put_back(app, chosen, previous, &msiexec(code))),
+        Ended::NotPutBack { install, back } => Err(not_put_back(app, chosen, previous, &msiexec(install), &msiexec(back))),
+        Ended::LaunchFailed | Ended::Other(_) => {
+            let code = match ended {
+                Ended::Other(Some(code)) => code.to_string(),
+                _ => "none".to_string(),
+            };
+            Err(format!("going back to {app} {chosen} stopped unexpectedly (code {code}). Check which version of {app} is installed."))
+        }
+    }
+}
+
+/// The `msiexec` arguments that remove one registration. Product codes come from the registry, so
+/// only the exact `{GUID}` shape is let into the elevated session.
+pub(super) fn removal(product_code: &str) -> Result<String, String> {
+    let inner = product_code.strip_prefix('{').and_then(|c| c.strip_suffix('}')).unwrap_or("");
+    let shape = inner.len() == 36 && inner.char_indices().all(|(i, c)| if matches!(i, 8 | 13 | 18 | 23) { c == '-' } else { c.is_ascii_hexdigit() });
+    if !shape {
+        return Err(format!("couldn't read the installed copy's registration ({product_code})"));
+    }
+    Ok(format!("/x {product_code} /passive /norestart"))
+}
+
+#[cfg(test)]
+#[path = "msi_downgrade_tests.rs"]
+mod tests;
