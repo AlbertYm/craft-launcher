@@ -2060,7 +2060,7 @@ pub mod windows {
             app: app.name,
             chosen: chosen.version,
             previous: previous.version,
-            remove: &mut || uninstall_msi(app, stop, &mut **phase.borrow_mut()),
+            remove: &mut || remove_msi_registrations(app, stop, &mut **phase.borrow_mut()),
             install_chosen: &mut || run_msi(chosen.file, destination, scope, stop, &mut **phase.borrow_mut()),
             reinstall_previous: &mut || run_msi(previous.file, destination, scope, stop, &mut **phase.borrow_mut()),
         })
@@ -2106,20 +2106,29 @@ pub mod windows {
     }
 
     pub fn uninstall_msi(app: &CraftApp, stop: &Stop, phase: &mut dyn FnMut(JobPhase)) -> Result<(), String> {
+        remove_msi_registrations(app, stop, phase).map_err(|removal| removal.error)
+    }
+
+    /// Removes every Windows Installer registration of `app` in turn. A failure says whether an
+    /// earlier registration was already removed, so a downgrade knows the app is partly gone.
+    fn remove_msi_registrations(app: &CraftApp, stop: &Stop, phase: &mut dyn FnMut(JobPhase)) -> Result<(), msi_downgrade::Removal> {
         let installs = crate::detect::windows::msi_installs(app);
         if installs.is_empty() {
-            return Err(format!("{} isn't registered with the Windows Installer", app.name));
+            return Err(msi_downgrade::Removal { error: format!("{} isn't registered with the Windows Installer", app.name), partly: false });
         }
-        in_turn(stop, phase, JobPhase::Removing, || {
-            for m in installs {
+        let mut removed = 0;
+        let result = in_turn(stop, phase, JobPhase::Removing, || {
+            for m in &installs {
                 let status = process::command(msiexec())
                     .args(["/x", &m.product_code, "/passive", "/norestart"])
                     .status()
                     .map_err(|e| format!("couldn't start the Windows Installer ({e})"))?;
                 explain(status.code())?;
+                removed += 1;
             }
             Ok(())
-        })
+        });
+        result.map_err(|error| msi_downgrade::Removal { error, partly: removed > 0 })
     }
 }
 

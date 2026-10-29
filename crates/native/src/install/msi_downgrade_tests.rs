@@ -2,9 +2,9 @@ use std::cell::RefCell;
 
 use super::*;
 
-/// Runs a step-by-step downgrade whose steps answer `remove`, `chosen` and `back`, and returns
-/// its result with the steps that ran, in order.
-fn downgrade(remove: Result<(), &str>, chosen: Result<(), &str>, back: Result<(), &str>) -> (Result<(), String>, Vec<&'static str>) {
+/// Runs a step-by-step downgrade whose steps answer `remove` (an error, and whether something was
+/// removed before it), `chosen` and `back`, and returns its result with the steps that ran, in order.
+fn downgrade(remove: Result<(), (&str, bool)>, chosen: Result<(), &str>, back: Result<(), &str>) -> (Result<(), String>, Vec<&'static str>) {
     let ran = RefCell::new(Vec::new());
     let result = run(Steps {
         app: "FilmCraft",
@@ -12,7 +12,7 @@ fn downgrade(remove: Result<(), &str>, chosen: Result<(), &str>, back: Result<()
         previous: "0.14.0",
         remove: &mut || {
             ran.borrow_mut().push("remove");
-            remove.map_err(str::to_string)
+            remove.map_err(|(error, partly)| Removal { error: error.to_string(), partly })
         },
         install_chosen: &mut || {
             ran.borrow_mut().push("install chosen");
@@ -35,9 +35,23 @@ fn the_newer_copy_goes_before_the_chosen_version_and_nothing_is_put_back_on_succ
 
 #[test]
 fn a_failed_removal_changes_nothing_and_installs_nothing() {
-    let (result, ran) = downgrade(Err("the Windows Installer stopped with error 1603"), Ok(()), Ok(()));
+    let (result, ran) = downgrade(Err(("the Windows Installer stopped with error 1603", false)), Ok(()), Ok(()));
     assert_eq!(result, Err("the Windows Installer stopped with error 1603".to_string()));
     assert_eq!(ran, ["remove"]);
+}
+
+/// An app registered twice (say per-user and all-users): the first copy is gone when removing the
+/// second fails, so the previous version goes back in, and nothing claims nothing changed.
+#[test]
+fn a_removal_that_fails_after_removing_one_copy_puts_the_previous_version_back() {
+    let (result, ran) = downgrade(Err(("the Windows Installer stopped with error 1603", true)), Ok(()), Ok(()));
+    assert_eq!(ran, ["remove", "put back"]);
+    let message = result.unwrap_err();
+    assert!(message.contains("FilmCraft 0.14.0 couldn't be fully removed") && message.contains("still installed"), "{message}");
+    assert!(!message.contains("nothing was changed"), "{message}");
+    let (result, _) = downgrade(Err(("error 1603", true)), Ok(()), Err("error 1603"));
+    let message = result.unwrap_err();
+    assert!(message.contains("putting it back failed too") && message.contains("Install FilmCraft again from the launcher"), "{message}");
 }
 
 #[test]
@@ -81,6 +95,8 @@ fn the_session_exit_code_says_which_step_stopped_it() {
     assert_eq!(ended(Some(code(REMOVAL_FAILED, 1603, 0))), Ended::RemovalFailed(1603));
     assert_eq!(ended(Some(code(PUT_BACK, 1603, 0))), Ended::PutBack(1603));
     assert_eq!(ended(Some(code(NOT_PUT_BACK, 1603, 1638))), Ended::NotPutBack { install: 1603, back: 1638 });
+    assert_eq!(ended(Some(code(PARTLY_REMOVED_PUT_BACK, 1603, 0))), Ended::PartlyRemovedPutBack(1603));
+    assert_eq!(ended(Some(code(PARTLY_REMOVED_NOT_PUT_BACK, 1603, 1638))), Ended::PartlyRemovedNotPutBack { removal: 1603, back: 1638 });
     // A plain msiexec or PowerShell code is never read as one of ours.
     for other in [1, 1603, 1602, 3010, -1] {
         assert_eq!(ended(Some(other)), Ended::Other(Some(other)), "{other}");
@@ -100,6 +116,10 @@ fn each_outcome_tells_the_person_what_is_installed_now() {
     assert!(back.contains("FilmCraft 0.14.0 was put back"), "{back}");
     let lost = report(Ended::NotPutBack { install: 1603, back: 1603 }).unwrap_err();
     assert!(lost.contains("Install FilmCraft again from the launcher"), "{lost}");
+    let partly = report(Ended::PartlyRemovedPutBack(1603)).unwrap_err();
+    assert!(partly.contains("couldn't be fully removed") && partly.contains("FilmCraft 0.14.0 is still installed"), "{partly}");
+    let partly_lost = report(Ended::PartlyRemovedNotPutBack { removal: 1603, back: 1603 }).unwrap_err();
+    assert!(partly_lost.contains("Install FilmCraft again from the launcher"), "{partly_lost}");
     let odd = report(Ended::Other(Some(5))).unwrap_err();
     assert!(odd.contains("Check which version of FilmCraft is installed"), "{odd}");
 }
@@ -142,9 +162,15 @@ mod powershell {
     /// Runs the script with removal, install and put-back steps exiting with these codes, and
     /// returns how it ended and which steps ran.
     fn session(remove: i32, chosen: i32, back: i32) -> (Ended, Vec<&'static str>) {
+        sessions(&[remove], chosen, back)
+    }
+
+    /// [`session`] for an app registered once per code in `removals`.
+    fn sessions(removals: &[i32], chosen: i32, back: i32) -> (Ended, Vec<&'static str>) {
         let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
-        let removals = [step(dir.path(), "remove", remove)];
+        let names = ["remove", "remove2"];
+        let removals: Vec<String> = removals.iter().zip(names).map(|(code, name)| step(dir.path(), name, *code)).collect();
         let script = script(cmd().to_str().unwrap(), &removals, &step(dir.path(), "chosen", chosen), &step(dir.path(), "back", back));
         let root = std::env::var_os("SystemRoot").unwrap();
         let powershell = Path::new(&root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
@@ -152,7 +178,7 @@ mod powershell {
             .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &msi_batch::encoded(&script)])
             .status()
             .unwrap();
-        let ran = ["remove", "chosen", "back"].into_iter().filter(|name| dir.path().join(name).exists()).collect();
+        let ran = ["remove", "remove2", "chosen", "back"].into_iter().filter(|name| dir.path().join(name).exists()).collect();
         (ended(status.code()), ran)
     }
 
@@ -171,6 +197,14 @@ mod powershell {
     #[test]
     fn a_failed_install_puts_the_previous_version_back_without_asking_again() {
         assert_eq!(session(0, 1603, 0), (Ended::PutBack(1603), vec!["remove", "chosen", "back"]));
+    }
+
+    #[test]
+    fn a_second_removal_that_fails_puts_the_previous_version_back_without_installing() {
+        assert_eq!(sessions(&[0, 1603], 0, 0), (Ended::PartlyRemovedPutBack(1603), vec!["remove", "remove2", "back"]));
+        assert_eq!(sessions(&[0, 1603], 0, 1638), (Ended::PartlyRemovedNotPutBack { removal: 1603, back: 1638 }, vec!["remove", "remove2", "back"]));
+        // The first removal failing still changes nothing.
+        assert_eq!(sessions(&[1603, 0], 0, 0), (Ended::RemovalFailed(1603), vec!["remove"]));
     }
 
     #[test]

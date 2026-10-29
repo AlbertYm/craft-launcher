@@ -32,16 +32,34 @@ pub(super) struct Steps<'a> {
     /// The version going in, and the one installed now (put back on failure).
     pub chosen: &'a str,
     pub previous: &'a str,
-    pub remove: &'a mut dyn FnMut() -> Result<(), String>,
+    pub remove: &'a mut dyn FnMut() -> Result<(), Removal>,
     pub install_chosen: &'a mut dyn FnMut() -> Result<(), String>,
     pub reinstall_previous: &'a mut dyn FnMut() -> Result<(), String>,
 }
 
+/// A removal that stopped: its error, and whether an earlier registration was already removed (an
+/// app can be registered more than once), in which case the app is partly gone.
+#[derive(Debug)]
+pub(super) struct Removal {
+    pub error: String,
+    pub partly: bool,
+}
+
 /// Removes the installed copy, installs the chosen version, and puts the previous one back if
-/// that install does not finish, one step after another.
+/// that install does not finish, one step after another. A removal that stops after removing
+/// something also puts the previous version back.
 pub(super) fn run(steps: Steps<'_>) -> Result<(), String> {
     let Steps { app, chosen, previous, remove, install_chosen, reinstall_previous } = steps;
-    remove()?;
+    if let Err(Removal { error, partly }) = remove() {
+        if !partly {
+            return Err(error);
+        }
+        let why = reason(&error);
+        return match reinstall_previous() {
+            Ok(()) => Err(partly_removed_put_back(app, previous, &why)),
+            Err(again) => Err(partly_removed_not_put_back(app, previous, &why, &reason(&again))),
+        };
+    }
     let why = match install_chosen() {
         Ok(()) => return Ok(()),
         Err(e) => reason(&e),
@@ -60,6 +78,14 @@ fn not_put_back(app: &str, chosen: &str, previous: &str, why: &str, again: &str)
     format!("{app} {chosen} couldn't be installed ({why}), and putting {previous} back failed too ({again}). Install {app} again from the launcher.")
 }
 
+fn partly_removed_put_back(app: &str, previous: &str, why: &str) -> String {
+    format!("{app} {previous} couldn't be fully removed ({why}). It was put back, so {app} {previous} is still installed.")
+}
+
+fn partly_removed_not_put_back(app: &str, previous: &str, why: &str, again: &str) -> String {
+    format!("{app} {previous} couldn't be fully removed ({why}), and putting it back failed too ({again}). Install {app} again from the launcher.")
+}
+
 /// A refused permission prompt reads as what happened, not as the cancel code.
 fn reason(error: &str) -> String {
     if error == CANCELLED { "permission wasn't given".to_string() } else { error.to_string() }
@@ -72,10 +98,13 @@ const OURS: i32 = 0x2000_0000;
 const REMOVAL_FAILED: i32 = 1;
 const PUT_BACK: i32 = 2;
 const NOT_PUT_BACK: i32 = 3;
+const PARTLY_REMOVED_PUT_BACK: i32 = 4;
+const PARTLY_REMOVED_NOT_PUT_BACK: i32 = 5;
 
 /// The elevated session: removes each installed registration (`remove`, `msiexec` arguments),
-/// installs `chosen`, and on failure installs `previous`, all through `program`. It exits 0 when
-/// the chosen version went in, or with one of the codes [`ended`] reads.
+/// installs `chosen`, and on failure installs `previous`, all through `program`. A removal that
+/// fails after another succeeded also installs `previous`. It exits 0 when the chosen version went
+/// in, or with one of the codes [`ended`] reads.
 pub(super) fn script(program: &str, remove: &[String], chosen: &str, previous: &str) -> String {
     let list = remove.iter().map(|l| msi_batch::quoted(l)).collect::<Vec<_>>().join(",");
     format!(
@@ -86,9 +115,16 @@ pub(super) fn script(program: &str, remove: &[String], chosen: &str, previous: &
          function Fine([int]$code) {{ $code -eq 0 -or $code -eq 3010 -or $code -eq 1641 }}\n\
          function Code([int]$code) {{ if ($code -lt 0 -or $code -gt 4094) {{ 4095 }} else {{ $code }} }}\n\
          function Ended([int]$step, [int]$first, [int]$second) {{ {OURS} -bor ($step -shl 24) -bor ((Code $first) -shl 12) -bor (Code $second) }}\n\
+         $removed = 0\n\
          foreach ($arguments in @({list})) {{\n\
          \x20 $code = Run $arguments\n\
-         \x20 if (-not (Fine $code)) {{ exit (Ended {REMOVAL_FAILED} $code 0) }}\n\
+         \x20 if (-not (Fine $code)) {{\n\
+         \x20   if ($removed -eq 0) {{ exit (Ended {REMOVAL_FAILED} $code 0) }}\n\
+         \x20   $back = Run {previous}\n\
+         \x20   if (Fine $back) {{ exit (Ended {PARTLY_REMOVED_PUT_BACK} $code 0) }}\n\
+         \x20   exit (Ended {PARTLY_REMOVED_NOT_PUT_BACK} $code $back)\n\
+         \x20 }}\n\
+         \x20 $removed++\n\
          }}\n\
          $code = Run {chosen}\n\
          if (Fine $code) {{ exit 0 }}\n\
@@ -116,6 +152,13 @@ pub(super) enum Ended {
         install: i32,
         back: i32,
     },
+    /// A removal failed with this code after another registration was removed; the previous
+    /// version is back.
+    PartlyRemovedPutBack(i32),
+    PartlyRemovedNotPutBack {
+        removal: i32,
+        back: i32,
+    },
     Other(Option<i32>),
 }
 
@@ -130,6 +173,8 @@ pub(super) fn ended(code: Option<i32>) -> Ended {
         _ if code & !0x0FFF_FFFF == OURS && step == REMOVAL_FAILED => Ended::RemovalFailed(first),
         _ if code & !0x0FFF_FFFF == OURS && step == PUT_BACK => Ended::PutBack(first),
         _ if code & !0x0FFF_FFFF == OURS && step == NOT_PUT_BACK => Ended::NotPutBack { install: first, back: second },
+        _ if code & !0x0FFF_FFFF == OURS && step == PARTLY_REMOVED_PUT_BACK => Ended::PartlyRemovedPutBack(first),
+        _ if code & !0x0FFF_FFFF == OURS && step == PARTLY_REMOVED_NOT_PUT_BACK => Ended::PartlyRemovedNotPutBack { removal: first, back: second },
         _ => Ended::Other(Some(code)),
     }
 }
@@ -148,6 +193,8 @@ pub(super) fn report(ended: Ended, app: &str, chosen: &str, previous: &str) -> R
         Ended::RemovalFailed(code) => Err(format!("{app} {previous} couldn't be removed ({}), so nothing was changed.", msiexec(code))),
         Ended::PutBack(code) => Err(put_back(app, chosen, previous, &msiexec(code))),
         Ended::NotPutBack { install, back } => Err(not_put_back(app, chosen, previous, &msiexec(install), &msiexec(back))),
+        Ended::PartlyRemovedPutBack(code) => Err(partly_removed_put_back(app, previous, &msiexec(code))),
+        Ended::PartlyRemovedNotPutBack { removal, back } => Err(partly_removed_not_put_back(app, previous, &msiexec(removal), &msiexec(back))),
         Ended::LaunchFailed | Ended::Other(_) => {
             let code = match ended {
                 Ended::Other(Some(code)) => code.to_string(),
