@@ -432,48 +432,55 @@ fn version_choices_have_room_and_nightly_scrolls_with_the_versions() {
     assert!(nightly_after.top() < nightly_before.top() - 80.0, "Nightly must scroll with release rows: {nightly_before:?} -> {nightly_after:?}");
 }
 
-#[test]
-fn choosing_an_app_version_turns_its_main_action_into_install() {
-    // A backend that answers ListVersions, unlike the shared Fake: the dialog clears the cached
-    // list when it opens, so the choice only appears once the reply arrives.
-    struct VersionsFake {
-        events: Rc<RefCell<Vec<Event>>>,
-        sent: Rc<RefCell<Vec<Command>>>,
-        answer: Vec<Release>,
+/// A backend that answers ListVersions, unlike the shared Fake: the dialog clears the cached
+/// list when it opens, so the choice only appears once the reply arrives.
+struct VersionsFake {
+    events: Rc<RefCell<Vec<Event>>>,
+    sent: Rc<RefCell<Vec<Command>>>,
+    answer: Vec<Release>,
+}
+
+impl Backend for VersionsFake {
+    fn send(&mut self, command: Command) {
+        if let Command::ListVersions { app } = &command {
+            self.events.borrow_mut().push(Event::Versions { app: app.clone(), result: Ok(self.answer.clone()) });
+        }
+        self.sent.borrow_mut().push(command);
     }
-    impl Backend for VersionsFake {
-        fn send(&mut self, command: Command) {
-            if let Command::ListVersions { app } = &command {
-                self.events.borrow_mut().push(Event::Versions { app: app.clone(), result: Ok(self.answer.clone()) });
-            }
-            self.sent.borrow_mut().push(command);
-        }
-        fn poll(&mut self) -> Vec<Event> {
-            std::mem::take(&mut *self.events.borrow_mut())
-        }
-        fn capabilities(&self) -> Capabilities {
-            Capabilities { manage_apps: true, reveal_label: "Show in Finder", self_update: true }
-        }
-        fn platform(&self) -> Option<Platform> {
-            Some(Platform { os: Os::MacOs, arch: Arch::Arm64 })
-        }
-        fn now(&self) -> i64 {
-            NOW
-        }
+    fn poll(&mut self) -> Vec<Event> {
+        std::mem::take(&mut *self.events.borrow_mut())
     }
-    let mut pin = release("photocraft", "0.4.0", NOW);
-    pin.assets[0].sha256 = Some("0".repeat(64));
+    fn capabilities(&self) -> Capabilities {
+        Capabilities { manage_apps: true, reveal_label: "Show in Finder", self_update: true }
+    }
+    fn platform(&self) -> Option<Platform> {
+        Some(Platform { os: Os::MacOs, arch: Arch::Arm64 })
+    }
+    fn now(&self) -> i64 {
+        NOW
+    }
+}
+
+/// A PhotoCraft release with a published checksum, so the selector offers it.
+fn signed_photocraft(v: &str) -> Release {
+    let mut r = release("photocraft", v, NOW);
+    r.assets[0].sha256 = Some("0".repeat(64));
+    r
+}
+
+type VersionsHarness = (Harness<'static, Option<LauncherUi>>, Rc<RefCell<Vec<Command>>>, Rc<RefCell<Vec<Event>>>);
+
+/// The suite (PhotoCraft 0.4.1 installed) with `latest` as PhotoCraft's checked release and
+/// `answer` as its published versions, opened on PhotoCraft's expanded version menu.
+fn version_menu(latest: Release, answer: Vec<Release>) -> VersionsHarness {
     struct DummyHost;
     impl Host for DummyHost {}
     let mut ev = events();
-    ev.push(Event::Latest { app: "photocraft".into(), latest: LatestRelease::Found(pin.clone()), from: Origin::GitHub });
+    ev.push(Event::Latest { app: "photocraft".into(), latest: LatestRelease::Found(latest), from: Origin::GitHub });
     let sent = Rc::new(RefCell::new(Vec::new()));
     let queue = Rc::new(RefCell::new(ev));
-    // A newer release takes the "latest release" label, so v0.4.0 is a plain pin.
-    let mut newer = release("photocraft", "0.5.0", NOW);
-    newer.assets[0].sha256 = Some("0".repeat(64));
-    let mut backend = Some(VersionsFake { events: queue.clone(), sent: sent.clone(), answer: vec![newer, pin] });
-    let harness = test_harness_builder(egui::Theme::Dark).with_size(egui::vec2(1180.0, 1200.0)).build_ui_state(
+    let mut backend = Some(VersionsFake { events: queue.clone(), sent: sent.clone(), answer });
+    let mut h = test_harness_builder(egui::Theme::Dark).with_size(egui::vec2(1180.0, 1200.0)).build_ui_state(
         move |ui, state: &mut Option<LauncherUi>| {
             if let Some(backend) = backend.take() {
                 *state = Some(LauncherUi::new(ui.ctx(), Box::new(backend), Settings { notify: false, ..Default::default() }));
@@ -485,7 +492,6 @@ fn choosing_an_app_version_turns_its_main_action_into_install() {
         },
         None,
     );
-    let mut h = harness;
     h.run_steps(6);
     h.get_by_label("More actions for PhotoCraft").click();
     h.run_steps(3);
@@ -493,6 +499,26 @@ fn choosing_an_app_version_turns_its_main_action_into_install() {
     h.run_steps(4);
     h.get_by_role_and_label(egui::accesskit::Role::ComboBox, "Version").click();
     h.run_steps(4);
+    (h, sent, queue)
+}
+
+#[test]
+fn closing_the_dialog_keeps_the_chosen_version_on_the_card() {
+    // As on a real machine: the checked release is still the newest when the older one is picked.
+    let (mut h, _, _) = version_menu(signed_photocraft("0.5.0"), vec![signed_photocraft("0.5.0"), signed_photocraft("0.4.0")]);
+    h.query_all_by_role_and_label(egui::accesskit::Role::Button, "v0.4.0").next().unwrap().click();
+    h.run_steps(4);
+    h.get_by_label("Close").click();
+    h.run_steps(4);
+    assert!(h.query_by_label("Version").is_none(), "Close closes the dialog");
+    assert!(h.query_by_label("Install version v0.4.0").is_some(), "the card keeps the chosen version after Close");
+}
+
+#[test]
+fn choosing_an_app_version_turns_its_main_action_into_install() {
+    // A newer release takes the "latest release" label, so v0.4.0 is a plain pin.
+    let pin = signed_photocraft("0.4.0");
+    let (mut h, sent, queue) = version_menu(pin.clone(), vec![signed_photocraft("0.5.0"), pin]);
     assert!(h.query_all_by_role_and_label(egui::accesskit::Role::Button, "v0.5.0 (latest release)").next().is_some());
     sent.borrow_mut().clear();
     h.query_all_by_role_and_label(egui::accesskit::Role::Button, "v0.4.0").next().unwrap().click();
