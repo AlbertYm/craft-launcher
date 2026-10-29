@@ -503,15 +503,23 @@ fn version_menu(latest: Release, answer: Vec<Release>) -> VersionsHarness {
 }
 
 #[test]
-fn closing_the_dialog_keeps_the_chosen_version_on_the_card() {
+fn closing_the_dialog_without_installing_drops_the_chosen_version() {
     // As on a real machine: the checked release is still the newest when the older one is picked.
-    let (mut h, _, _) = version_menu(signed_photocraft("0.5.0"), vec![signed_photocraft("0.5.0"), signed_photocraft("0.4.0")]);
+    let (mut h, sent, _) = version_menu(signed_photocraft("0.5.0"), vec![signed_photocraft("0.5.0"), signed_photocraft("0.4.0")]);
     h.query_all_by_role_and_label(egui::accesskit::Role::Button, "v0.4.0").next().unwrap().click();
     h.run_steps(4);
+    assert!(h.query_all_by_label("Install version v0.4.0").count() > 0, "the dialog offers the chosen version");
+    sent.borrow_mut().clear();
     h.get_by_label("Close").click();
     h.run_steps(4);
     assert!(h.query_by_label("Version").is_none(), "Close closes the dialog");
-    assert!(h.query_by_label("Install version v0.4.0").is_some(), "the card keeps the chosen version after Close");
+    assert!(h.query_by_label("Install version v0.4.0").is_none(), "the card goes back to its own action");
+    let configured = sent.borrow().iter().rev().find_map(|c| match c {
+        Command::Configure(o) => Some(o.versions.get("photocraft").cloned()),
+        _ => None,
+    });
+    assert_eq!(configured, Some(None), "the choice from before (latest release) is restored");
+    assert!(sent.borrow().iter().any(|c| matches!(c, Command::CheckForUpdates { force: true })), "the restored choice is checked again");
 }
 
 #[test]
@@ -540,6 +548,7 @@ fn choosing_an_app_version_turns_its_main_action_into_install() {
     assert!(sent.borrow().iter().any(|c| matches!(c, Command::Install { app } if app == "photocraft")));
     assert!(!sent.borrow().iter().any(|c| matches!(c, Command::Launch { app } if app == "photocraft")));
     assert!(h.query_by_label("Version").is_none(), "installing closes the dialog");
+    assert!(h.query_by_label("Install version v0.4.0").is_some(), "installing from the dialog keeps the chosen version");
     // Once the pinned version is the installed copy, the card opens it again.
     let opens = h.query_all_by_label("Open").count();
     queue.borrow_mut().push(Event::Detected {

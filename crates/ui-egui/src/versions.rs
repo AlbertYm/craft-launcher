@@ -34,11 +34,29 @@ impl LauncherUi {
             }
         });
         if install {
-            // May open the folder dialog in this one's place; `dialogs` keeps it.
+            // Installing keeps the new choice. May open the folder dialog in this one's place;
+            // `dialogs` keeps it.
+            self.version_before = None;
             self.install_app(id);
             return true;
         }
         close
+    }
+
+    /// The dialog closed without installing: the choice made in it was only a draft, so put the
+    /// one it had before back, and check again so the card shows that release (Open, not Install).
+    pub(crate) fn revert_version_choice(&mut self) {
+        let Some((id, before)) = self.version_before.take() else { return };
+        if self.settings.versions.get(&id).cloned().unwrap_or_default() == before {
+            return;
+        }
+        if before == VersionTrack::Stable {
+            self.settings.versions.remove(&id);
+        } else {
+            self.settings.versions.insert(id, before);
+        }
+        self.configure();
+        self.check_now_from_ui();
     }
 
     /// The dialog's Install button for the chosen version: its label, and whether that exact release

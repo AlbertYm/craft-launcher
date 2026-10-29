@@ -146,6 +146,9 @@ pub struct LauncherUi {
     pub(crate) launcher_update: Option<Release>,
     pub(crate) version_lists: std::collections::HashMap<String, Result<Vec<Release>, String>>,
     pub(crate) version_requests: std::collections::HashSet<String>,
+    /// While the Choose version dialog is open: its app and the choice it had before, put back
+    /// unless the dialog's Install keeps the new one.
+    pub(crate) version_before: Option<(String, artcraft_launcher_core::protocol::VersionTrack)>,
     /// The launcher's own update, while it downloads and installs.
     pub(crate) launcher_job: Option<artcraft_launcher_core::protocol::JobPhase>,
     /// The new launcher is in place: quit so it can start.
@@ -254,6 +257,7 @@ impl LauncherUi {
             launcher_update: None,
             version_lists: std::collections::HashMap::new(),
             version_requests: std::collections::HashSet::new(),
+            version_before: None,
             launcher_job: None,
             restart_requested: false,
             announcements: Vec::new(),
@@ -459,6 +463,7 @@ impl LauncherUi {
     pub(crate) fn open_versions(&mut self, id: &str) {
         self.version_lists.remove(id);
         self.version_requests.remove(id);
+        self.version_before = Some((id.to_string(), self.settings.versions.get(id).cloned().unwrap_or_default()));
         self.dialog = Some(Dialog::Versions(id.to_string()));
         self.request_versions(id);
     }

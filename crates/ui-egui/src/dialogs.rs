@@ -45,6 +45,10 @@ impl LauncherUi {
         }
         if close || response.should_close() {
             self.dialog = None;
+            if matches!(dialog, Dialog::Versions(_)) {
+                // Close, Escape or a click outside: a version chosen there is dropped.
+                self.revert_version_choice();
+            }
         } else {
             self.dialog = Some(dialog);
         }
