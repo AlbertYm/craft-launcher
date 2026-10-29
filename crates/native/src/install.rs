@@ -46,12 +46,30 @@ pub struct Job<'a> {
     pub downgrade: Option<Downgrade<'a>>,
 }
 
-/// The installed version's own release and package, downloaded and checked before a downgrade
-/// changes anything, so a failed downgrade can put it back.
+/// How a downgrade the person chose is undone if it fails.
 #[derive(Clone, Copy)]
-pub struct Downgrade<'a> {
-    pub previous: &'a Release,
-    pub asset: &'a Asset,
+pub enum Downgrade<'a> {
+    /// The installed version's own release and package, downloaded and checked before a downgrade
+    /// changes anything, so a failed Windows Installer downgrade can put it back.
+    Reinstall { previous: &'a Release, asset: &'a Asset },
+    /// The installed copy is moved aside, not removed, until the older one is in place, and moved
+    /// back if that fails (see [`keeps_old_copy`]). No older package is needed.
+    KeepOldCopy,
+}
+
+/// Whether going back over `existing` keeps the old copy aside until the new one is in place: a
+/// macOS bundle the launcher replaces itself, the same way it updates one.
+pub fn keeps_old_copy(kind: PackageKind, existing: Option<&Installed>) -> bool {
+    kind == PackageKind::Dmg && existing.is_some_and(|inst| inst.source == InstallSource::MacApp)
+}
+
+/// Whether `downgrade` has a way back for this kind of install.
+fn downgrade_is_safe(downgrade: Option<Downgrade<'_>>, kind: PackageKind, existing: Option<&Installed>) -> bool {
+    match downgrade {
+        None => true,
+        Some(Downgrade::Reinstall { .. }) => kind == PackageKind::Msi && existing.is_some_and(|inst| inst.source == InstallSource::Msi),
+        Some(Downgrade::KeepOldCopy) => keeps_old_copy(kind, existing),
+    }
 }
 
 /// Downloads and installs `asset` of `release`. Returns a record when the launcher owns the
@@ -98,7 +116,7 @@ pub fn install_at(
     }
     bind_artifact_version(app, release, asset)?;
     // A feed can't send an app back to an older build; only a version the person chose by name
-    // (a downgrade with the installed version's package to put back) gets past this.
+    // (a downgrade with a way back if it fails) gets past this.
     if !job.replace
         && job.downgrade.is_none()
         && let Some(inst) = existing
@@ -107,7 +125,7 @@ pub fn install_at(
     {
         return Err(format!("Cannot update {} to {}: installed version {} is newer", app.name, release.version_label(), inst_v));
     }
-    if job.downgrade.is_some() && !(kind == PackageKind::Msi && existing.is_some_and(|inst| inst.source == InstallSource::Msi)) {
+    if !downgrade_is_safe(job.downgrade, kind, existing) {
         return Err(format!("Going back to an older version of {} isn't available for this kind of install yet.", app.name));
     }
     log::info!("{}: starting {} to {} ({})", app.name, if existing.is_some() { "update" } else { "install" }, release.version_label(), kind.label());
@@ -136,11 +154,11 @@ pub fn install_at(
     // The package to put back comes first: without it, nothing is removed.
     #[cfg_attr(not(windows), allow(unused_variables))]
     let rollback = match job.downgrade {
-        Some(d) => {
-            let (file, sha256) = download(d.previous, d.asset, job)?;
-            Some((file, sha256, d.previous.version_label()))
+        Some(Downgrade::Reinstall { previous, asset }) => {
+            let (file, sha256) = download(previous, asset, job)?;
+            Some((file, sha256, previous.version_label()))
         }
-        None => None,
+        Some(Downgrade::KeepOldCopy) | None => None,
     };
     // The checksum is kept for the Windows all-users route, which checks the held package again.
     #[cfg_attr(not(windows), allow(unused_variables))]
@@ -2539,13 +2557,79 @@ mod tests {
                 phase: &mut phase,
                 install_locations: &locations,
                 replace: false,
-                downgrade: Some(Downgrade { previous: &newer, asset: &newer_msi }),
+                downgrade: Some(Downgrade::Reinstall { previous: &newer, asset: &newer_msi }),
             };
             install(app, &older, &older_msi, PackageKind::Msi, Some(&portable), None, &mut job).unwrap_err()
         };
         assert!(error.contains("isn't available for this kind of install"), "{error}");
         assert!(phases.is_empty(), "nothing started");
         assert!(!paths.downloads().exists(), "nothing was downloaded");
+    }
+
+    #[test]
+    fn each_way_back_is_allowed_only_for_the_install_it_can_undo() {
+        let installed = |source| Installed { version: version::parse("0.5.0"), source, location: String::new(), package: None };
+        let (mac, msi, portable) = (installed(InstallSource::MacApp), installed(InstallSource::Msi), installed(InstallSource::Launcher));
+        let (release, asset) = (Release::default(), Asset::default());
+        let reinstall = Some(Downgrade::Reinstall { previous: &release, asset: &asset });
+        let keep = Some(Downgrade::KeepOldCopy);
+        // Only a macOS bundle over a Mac app keeps its old copy aside.
+        assert!(keeps_old_copy(PackageKind::Dmg, Some(&mac)));
+        assert!(!keeps_old_copy(PackageKind::Dmg, Some(&portable)));
+        assert!(!keeps_old_copy(PackageKind::Dmg, None));
+        assert!(!keeps_old_copy(PackageKind::Msi, Some(&mac)));
+        // Each way back fits one kind of install; anything else is refused.
+        assert!(downgrade_is_safe(None, PackageKind::AppImage, Some(&portable)));
+        assert!(downgrade_is_safe(keep, PackageKind::Dmg, Some(&mac)));
+        assert!(downgrade_is_safe(reinstall, PackageKind::Msi, Some(&msi)));
+        assert!(!downgrade_is_safe(keep, PackageKind::Msi, Some(&msi)));
+        assert!(!downgrade_is_safe(keep, PackageKind::Dmg, Some(&portable)));
+        assert!(!downgrade_is_safe(keep, PackageKind::AppImage, Some(&portable)));
+        assert!(!downgrade_is_safe(reinstall, PackageKind::Dmg, Some(&mac)));
+    }
+
+    /// Going back over a Mac app passes the "installed version is newer" guard and installs the
+    /// older bundle the way an update does, with no older package fetched first.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_mac_downgrade_goes_ahead_without_a_package_to_put_back() {
+        use crate::http::tests::{Reply, body, serve};
+        let app = CraftApp::by_id("wordcraft").unwrap();
+        let (body, sha) = body();
+        let (url, requests) = serve(body.clone(), vec![Reply::Full]);
+        let asset = Asset { name: "wordcraft-0.3.0-macos-universal.dmg".into(), size: body.len() as u64, url, sha256: Some(sha) };
+        let release = Release { tag: "v0.3.0".into(), version: version::parse("0.3.0"), assets: vec![asset.clone()], ..Release::default() };
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let http = Http::new().unwrap();
+        let installed = Installed {
+            version: version::parse("0.4.0"),
+            source: InstallSource::MacApp,
+            location: dir.path().join("WordCraft.app").display().to_string(),
+            package: None,
+        };
+        let run = |downgrade| {
+            let mut phases = Vec::new();
+            let mut phase = |p: JobPhase| phases.push(p);
+            let mut job = Job {
+                http: &http,
+                paths: &paths,
+                stop: &Stop::default(),
+                phase: &mut phase,
+                install_locations: &InstallLocations::default(),
+                replace: false,
+                downgrade,
+            };
+            install(app, &release, &asset, PackageKind::Dmg, Some(&installed), None, &mut job).unwrap_err()
+        };
+        // Not chosen by name: still refused as older than the installed copy.
+        let refused = run(None);
+        assert!(refused.contains("installed version 0.4.0 is newer"), "{refused}");
+        assert!(requests.lock().unwrap().is_empty(), "nothing was downloaded");
+        // Chosen by name: only the chosen version is downloaded, then this system can't open a DMG.
+        let error = run(Some(Downgrade::KeepOldCopy));
+        assert!(error.contains("isn't supported"), "{error}");
+        assert_eq!(requests.lock().unwrap().len(), 1, "one package, the chosen one");
     }
 
     #[test]
