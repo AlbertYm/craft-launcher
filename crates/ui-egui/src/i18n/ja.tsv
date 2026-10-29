@@ -388,6 +388,7 @@ filter	Installed	インストール済み
 column	Version	バージョン
 column	Author	作者
 	Choose version	バージョンを選択
+	latest {version}	最新 {version}
 	{version} (latest release)	{version}（最新リリース）
 	Launcher version	ランチャーのバージョン
 	Nightly	ナイトリービルド

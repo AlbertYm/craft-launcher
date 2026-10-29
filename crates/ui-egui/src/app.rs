@@ -486,6 +486,8 @@ impl LauncherUi {
         // actually show: English where the system has no CJK face for the preference.
         set_current(effective_lang(&self.settings.language));
         self.configure();
+        // A kept version's card notes a newer release; that needs the app's published list.
+        self.request_pinned_lists();
         if !self.started {
             self.started = true;
             self.backend.send(Command::CheckForUpdates { force: false });

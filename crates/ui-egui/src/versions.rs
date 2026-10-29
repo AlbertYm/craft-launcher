@@ -204,4 +204,58 @@ impl LauncherUi {
         artcraft_launcher_core::platform::pick_asset(r, &stems, platform, platform.download_kinds())
             .is_some_and(|(asset, _)| asset.sha256.is_some() || r.sums_asset().is_some())
     }
+
+    /// The newer release a version kept on purpose is behind, for a quiet note beside it on the
+    /// card. `None` unless the app is kept on an exact version and its published list (fetched in
+    /// the background by [`request_pinned_lists`](Self::request_pinned_lists)) has a newer stable
+    /// release. It is never an update: no badge, Update all or notification counts it.
+    pub(crate) fn behind_latest(&self, entry: &crate::model::AppEntry) -> Option<String> {
+        let track = self.settings.versions.get(entry.app.id)?;
+        let releases = self.version_lists.get(entry.app.id)?.as_ref().ok()?;
+        behind(track, entry.installed.as_ref()?.version.as_ref()?, releases)
+    }
+
+    /// Asks once for the published versions of each app kept on an exact version, so its card can
+    /// say when a newer release is out.
+    pub(crate) fn request_pinned_lists(&mut self) {
+        let pinned: Vec<String> =
+            self.settings.versions.iter().filter(|(_, track)| matches!(track, VersionTrack::Pinned(_))).map(|(id, _)| id.clone()).collect();
+        for id in pinned {
+            self.request_versions(&id);
+        }
+    }
+}
+
+/// The newest stable release in `releases`, when `track` keeps an exact version and that release is
+/// newer than `installed`.
+fn behind(track: &VersionTrack, installed: &version::Version, releases: &[Release]) -> Option<String> {
+    if !matches!(track, VersionTrack::Pinned(_)) {
+        return None;
+    }
+    let newest = choose_version(releases, &VersionTrack::Stable)?;
+    newest.version.as_ref().is_some_and(|v| version::is_newer(v, installed)).then(|| newest.version_label())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tagged(v: &str, prerelease: bool) -> Release {
+        Release { tag: format!("v{v}"), version: version::parse(v), prerelease, ..Default::default() }
+    }
+
+    #[test]
+    fn only_a_kept_version_behind_the_newest_stable_release_is_noted() {
+        let releases = [tagged("0.18.0-nightly.20261029", true), tagged("0.17.0", false), tagged("0.16.0", false)];
+        let pinned = VersionTrack::Pinned("v0.16.0".into());
+        let installed = |v: &str| version::parse(v).unwrap();
+        // Kept on 0.16.0 with 0.17.0 out: noted, and a nightly is never "the latest".
+        assert_eq!(behind(&pinned, &installed("0.16.0"), &releases), Some("0.17.0".to_string()));
+        // Up to date, or ahead: nothing to say.
+        assert_eq!(behind(&pinned, &installed("0.17.0"), &releases), None);
+        assert_eq!(behind(&pinned, &installed("0.18.0"), &releases), None);
+        // Following the latest release or nightly is not keeping a version.
+        assert_eq!(behind(&VersionTrack::Stable, &installed("0.16.0"), &releases), None);
+        assert_eq!(behind(&VersionTrack::Nightly, &installed("0.16.0"), &releases), None);
+    }
 }

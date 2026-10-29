@@ -387,6 +387,7 @@ filter	Installed	Zainstalowane
 column	Version	Wersja
 column	Author	Autor
 	Choose version	Wybierz wersję
+	latest {version}	najnowsza {version}
 	{version} (latest release)	{version} (najnowsze wydanie)
 	Launcher version	Wersja programu uruchamiającego
 	Nightly	Wersja nocna

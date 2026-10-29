@@ -381,6 +381,7 @@ filter	Installed	Установлены
 column	Version	Версия
 column	Author	Автор
 	Choose version	Выбрать версию
+	latest {version}	последняя {version}
 	{version} (latest release)	{version} (последний релиз)
 	Launcher version	Версия лаунчера
 	Nightly	Ночная сборка

@@ -353,6 +353,7 @@ figcraft	Interface design and prototyping	界面设计与原型制作
 column	Author	作者
 column	Version	版本
 	Choose version	选择版本
+	latest {version}	最新 {version}
 	{version} (latest release)	{version}（最新发布）
 	Launcher version	启动器版本
 	Nightly	每日构建版

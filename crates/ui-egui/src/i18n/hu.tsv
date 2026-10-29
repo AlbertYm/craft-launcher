@@ -386,6 +386,7 @@ filter	Installed	Telepítve
 column	Version	Verzió
 column	Author	Szerző
 	Choose version	Verzió kiválasztása
+	latest {version}	legújabb: {version}
 	{version} (latest release)	{version} (legújabb kiadás)
 	Launcher version	Az indító verziója
 	Nightly	Éjszakai kiadás

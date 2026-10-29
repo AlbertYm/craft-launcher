@@ -485,7 +485,8 @@ impl LauncherUi {
 
         // The top strip: the version in the app's colour, and its GitHub page.
         let status = entry.status(self.platform, self.caps.manage_apps);
-        let version = crate::card_parts::strip_version(&entry, &status);
+        let behind = self.behind_latest(&entry);
+        let version = crate::card_parts::strip_version(&entry, &status, behind.as_deref());
         let strip = Rect::from_min_size(rect.min, vec2(rect.width(), STRIP_H));
         painter.hline(strip.x_range(), strip.bottom() - 0.5, t.hairline());
         {
@@ -495,7 +496,10 @@ impl LauncherUi {
             if !version.is_empty() {
                 let github_w = widgets::hud_galley(&strip_ui, &format!("{} ↗", tl!("GitHub")), t.muted).size().x;
                 let room = (strip_ui.available_width() - github_w - 16.0).max(0.0);
-                widgets::hud_elided(&mut strip_ui, &version, if in_colour { t.app_ink(app) } else { t.muted }, room);
+                let highlight = if in_colour { t.app_ink(app) } else { t.muted };
+                let spans: Vec<(&str, egui::Color32)> =
+                    version.iter().map(|(text, lit)| (text.as_str(), if *lit { highlight } else { t.muted })).collect();
+                widgets::hud_elided_spans(&mut strip_ui, &spans, room);
             }
             strip_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 16.0;
@@ -773,26 +777,30 @@ impl LauncherUi {
         }
     }
 
-    /// The version column: what is installed, with an arrow to the new one in the app's colour
-    /// when an update waits; the latest, for an app not installed yet.
+    /// The version column: what is installed, with an arrow to the new one (only that in the app's
+    /// colour) when an update waits, or a quiet note of the newer release for a version kept on
+    /// purpose; the latest, for an app not installed yet.
     fn table_version_cell(&self, ui: &mut Ui, entry: &AppEntry, status: &AppStatus, t: &Tokens) {
-        let mut mono = |text: String, color| ui.label(RichText::new(text).family(egui::FontFamily::Monospace).color(color));
-        match (*status == AppStatus::UpdateAvailable).then(|| entry.installed_label().zip(entry.latest_label())).flatten() {
-            Some((from, to)) => {
-                mono(format!("{from} → {to}"), t.app_ink(entry.app));
-            }
+        let mono = |text: String, color| RichText::new(text).family(egui::FontFamily::Monospace).color(color);
+        let (first, second) = match (*status == AppStatus::UpdateAvailable).then(|| entry.installed_label().zip(entry.latest_label())).flatten() {
+            Some((from, to)) => (mono(format!("{from} → "), t.ink), Some(mono(to, t.app_ink(entry.app)))),
             None => match (entry.installed_label(), entry.latest_label()) {
                 (Some(installed), _) => {
-                    mono(installed, t.ink);
+                    let note =
+                        self.behind_latest(entry).map(|newer| mono(format!(" · {}", fmt(tl!("latest {version}"), &[("version", &newer)])), t.faint));
+                    (mono(installed, t.ink), note)
                 }
-                (None, Some(latest)) => {
-                    mono(latest, t.faint);
-                }
-                (None, None) => {
-                    mono("—".into(), t.faint);
-                }
+                (None, Some(latest)) => (mono(latest, t.faint), None),
+                (None, None) => (mono("—".into(), t.faint), None),
             },
+        };
+        // One label in two colours, so it reads as one piece of text ("0.4.1 → 0.5.0").
+        let style = ui.style().clone();
+        let mut job = egui::text::LayoutJob::default();
+        for part in std::iter::once(first).chain(second) {
+            part.append_to(&mut job, &style, egui::FontSelection::Default, egui::Align::Center);
         }
+        ui.label(job);
     }
 
     /// The released column: the release date, or an em dash, with "how long ago" in its tooltip.

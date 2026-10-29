@@ -373,6 +373,7 @@ filter	Installed	Instalados
 column	Version	Versão
 column	Author	Autor
 	Choose version	Escolher versão
+	latest {version}	mais recente {version}
 	{version} (latest release)	{version} (último lançamento)
 	Launcher version	Versão do inicializador
 	Nightly	Versão noturna
