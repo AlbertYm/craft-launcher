@@ -2,6 +2,7 @@
 use artcraft_launcher_core::catalog::{CraftApp, LAUNCHER, LAUNCHER_ID};
 use artcraft_launcher_core::protocol::VersionTrack;
 use artcraft_launcher_core::release::{Release, is_nightly};
+use artcraft_launcher_core::version;
 use egui::{RichText, Ui};
 
 use crate::app::LauncherUi;
@@ -17,15 +18,53 @@ impl LauncherUi {
         ui.heading(format!("{} · {}", app.name, tl!("Choose version")));
         ui.add_space(8.0);
         let label = ui.label(tl!("Version"));
-        let selected = self.version_combo(ui, id, app, 440.0, label.id);
+        // A choice keeps the dialog open: the Install button below follows it.
+        self.version_combo(ui, id, app, 440.0, label.id);
         ui.add_space(10.0);
-        ui.label(
-            RichText::new(tl!("After choosing a version, Install version appears in place of Open. Your files may not open in older versions."))
-                .color(t.muted),
-        );
+        ui.label(RichText::new(tl!("Your files may not open in older versions.")).color(t.muted));
         ui.label(RichText::new(tl!("Enable automatic installs in Settings to follow new nightly builds.")).color(t.muted));
         ui.add_space(12.0);
-        selected || widgets::button(ui, tl!("Close"), Kind::Secondary, 100.0).clicked()
+        let (mut close, mut install) = (false, false);
+        ui.horizontal(|ui| {
+            close = widgets::button(ui, tl!("Close"), Kind::Secondary, 100.0).clicked();
+            if let Some((label, ready)) = self.chosen_install(id) {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    install = ui.add_enabled_ui(ready, |ui| widgets::button(ui, &label, Kind::Primary, 220.0)).inner.clicked();
+                });
+            }
+        });
+        if install {
+            // May open the folder dialog in this one's place; `dialogs` keeps it.
+            self.install_app(id);
+            return true;
+        }
+        close
+    }
+
+    /// The dialog's Install button for the chosen version: its label, and whether that exact release
+    /// has been checked, can be downloaded here and isn't the installed copy. `None` when there is
+    /// nothing to install (no choice the backend can answer, or a job already running).
+    fn chosen_install(&self, id: &str) -> Option<(String, bool)> {
+        let entry = self.entry(id)?;
+        if !self.caps.manage_apps || entry.job.is_some() {
+            return None;
+        }
+        let release = entry.release();
+        let tag = match self.settings.versions.get(id).cloned().unwrap_or_default() {
+            VersionTrack::Pinned(tag) => tag,
+            VersionTrack::Nightly => match release {
+                Some(r) if is_nightly(r) => r.tag.clone(),
+                _ if self.checking => return Some((tl!("Checking…").to_string(), false)),
+                _ => return None,
+            },
+            VersionTrack::Stable => release.filter(|r| !r.prerelease)?.tag.clone(),
+        };
+        let installed = entry.installed.as_ref().and_then(|i| i.version.as_ref());
+        if installed.is_some() && installed == version::parse(&tag).as_ref() {
+            return Some((tl!("Installed").to_string(), false));
+        }
+        let ready = release.is_some_and(|r| r.tag == tag) && entry.has_download(self.platform);
+        Some((crate::fmt(tl!("Install version {version}"), &[("version", &tag)]), ready))
     }
 
     pub(crate) fn version_combo(&mut self, ui: &mut Ui, id: &str, app: &CraftApp, width: f32, label: egui::Id) -> bool {

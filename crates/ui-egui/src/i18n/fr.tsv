@@ -389,5 +389,5 @@ column	Author	Auteur
 	Install version {version}	Installer la version {version}
 	Download selected version	Télécharger la version choisie
 	Older launcher versions require a manual reinstall.	Les anciennes versions du lanceur nécessitent une réinstallation manuelle.
-	After choosing a version, Install version appears in place of Open. Your files may not open in older versions.	Après avoir choisi une version, Installer la version apparaît à la place de Ouvrir. Tes fichiers pourraient ne pas s’ouvrir avec une ancienne version.
+	Your files may not open in older versions.	Tes fichiers pourraient ne pas s’ouvrir avec une ancienne version.
 	Enable automatic installs in Settings to follow new nightly builds.	Active les installations automatiques dans les paramètres pour recevoir les nouvelles versions nocturnes.

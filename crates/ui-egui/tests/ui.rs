@@ -495,15 +495,18 @@ fn choosing_an_app_version_turns_its_main_action_into_install() {
         "selection must refresh the release used by Install"
     );
     assert!(!sent.borrow().iter().any(|c| matches!(c, Command::Install { .. })), "selection itself must not install");
-    h.run_steps(2);
-    assert!(h.query_by_label("Version").is_none(), "choosing a version closes the dialog");
-    h.get_by_label("More actions for PhotoCraft").click();
-    h.run_steps(3);
-    assert!(h.query_by_label("Install selected version").is_none(), "no second install action should hide in the menu");
-    h.get_all_by_label("Install version v0.4.0").next().unwrap().click();
-    h.run_steps(2);
+    h.run_steps(4);
+    assert!(h.query_by_label("Version").is_some(), "choosing a version keeps the dialog open");
+    // The dialog's own Install sits on its Close button's row; the card shows the same label.
+    let row = h.get_by_label("Close").rect().center().y;
+    h.get_all_by_label("Install version v0.4.0")
+        .find(|n| (n.rect().center().y - row).abs() < 4.0)
+        .expect("the dialog offers Install for the chosen version")
+        .click();
+    h.run_steps(4);
     assert!(sent.borrow().iter().any(|c| matches!(c, Command::Install { app } if app == "photocraft")));
     assert!(!sent.borrow().iter().any(|c| matches!(c, Command::Launch { app } if app == "photocraft")));
+    assert!(h.query_by_label("Version").is_none(), "installing closes the dialog");
     // Once the pinned version is the installed copy, the card opens it again.
     let opens = h.query_all_by_label("Open").count();
     queue.borrow_mut().push(Event::Detected {

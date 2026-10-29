@@ -359,5 +359,5 @@ column	Author	Autor
 	Install version {version}	Nainstalovat verzi {version}
 	Download selected version	Stáhnout vybranou verzi
 	Older launcher versions require a manual reinstall.	Starší verze spouštěče vyžadují ruční přeinstalaci.
-	After choosing a version, Install version appears in place of Open. Your files may not open in older versions.	Po výběru verze se na místě Otevřít zobrazí Nainstalovat verzi. Starší verze nemusí vaše soubory otevřít.
+	Your files may not open in older versions.	Starší verze nemusí vaše soubory otevřít.
 	Enable automatic installs in Settings to follow new nightly builds.	Chcete-li automaticky dostávat nová noční sestavení, zapněte v nastavení automatické instalace.
