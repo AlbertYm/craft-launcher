@@ -53,6 +53,11 @@ enum Primary {
     /// The download is already here; only the install step is left. Carries the button's label.
     Retry(String),
     Update(String),
+    /// A pinned release only installs after the backend has checked that exact tag.
+    SelectedVersion {
+        tag: String,
+        checked: bool,
+    },
     Open,
     Download(String),
     Unavailable(&'static str),
@@ -815,6 +820,14 @@ impl LauncherUi {
                 (_, None) => Primary::Unavailable(tl!("Not available")),
             };
         }
+        // Once the pinned version is the installed one, the normal statuses (Open) take over again.
+        if let Some(artcraft_launcher_core::protocol::VersionTrack::Pinned(tag)) = self.settings.versions.get(entry.app.id)
+            && entry.installed.as_ref().and_then(|i| i.version.as_ref()) != artcraft_launcher_core::version::parse(tag).as_ref()
+        {
+            let checked = entry.release().is_some_and(|r| &r.tag == tag)
+                && !matches!(status, AppStatus::Checking | AppStatus::NoRelease | AppStatus::Unavailable);
+            return Primary::SelectedVersion { tag: tag.clone(), checked };
+        }
         match status {
             AppStatus::Available if entry.ready => Primary::Retry(tl!("Retry install").into()),
             AppStatus::UpdateAvailable if entry.ready => {
@@ -961,6 +974,12 @@ impl LauncherUi {
                     self.install_app(id);
                 }
             }
+            Primary::SelectedVersion { tag, checked } => {
+                let label = fmt(tl!("Install version {version}"), &[("version", &tag)]);
+                if ui.add_enabled_ui(checked, |ui| widgets::button(ui, &label, Kind::Primary, main_w)).inner.clicked() {
+                    self.install_app(id);
+                }
+            }
             Primary::Open => {
                 if widgets::button(ui, tl!("Open"), Kind::Secondary, main_w).clicked() {
                     self.launch_app(id);
@@ -991,6 +1010,10 @@ impl LauncherUi {
         let manage = self.caps.manage_apps;
         let reveal = self.caps.reveal_label;
         widgets::more_menu(ui, entry.app.name, |ui| {
+            if ui.button(tl!("Choose version")).clicked() {
+                self.open_versions(&id);
+                ui.close();
+            }
             if entry.release().is_some() && ui.button(tl!("Release notes")).clicked() {
                 self.dialog = Some(Dialog::Notes(id.clone()));
                 ui.close();

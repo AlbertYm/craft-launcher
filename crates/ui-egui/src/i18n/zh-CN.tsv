@@ -352,3 +352,12 @@ figcraft	Interface design and prototyping	界面设计与原型制作
 	Last updated: {date}	最后更新：{date}
 column	Author	作者
 column	Version	版本
+	Choose version	选择版本
+	Launcher version	启动器版本
+	Nightly	每日构建版
+	No nightly build published yet	尚未发布每日构建版
+	Install version {version}	安装版本 {version}
+	Download selected version	下载所选版本
+	Older launcher versions require a manual reinstall.	旧版启动器需要手动重新安装。
+	After choosing a version, Install version appears in place of Open. Your files may not open in older versions.	选择版本后，「打开」会变为「安装版本」。旧版可能无法打开你的文件。
+	Enable automatic installs in Settings to follow new nightly builds.	在设置中启用自动安装，即可跟进新的每日构建版。

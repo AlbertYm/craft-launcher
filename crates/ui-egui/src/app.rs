@@ -115,6 +115,7 @@ pub(crate) enum Dialog {
     Replace { app: String, path: String },
     Settings,
     LauncherUpdate(artcraft_launcher_core::Release),
+    Versions(String),
 }
 
 impl Dialog {
@@ -128,6 +129,7 @@ impl Dialog {
             Dialog::Replace { app, .. } => ("replace", app),
             Dialog::Settings => ("settings", ""),
             Dialog::LauncherUpdate(r) => ("launcher-update", &r.tag),
+            Dialog::Versions(id) => ("versions", id),
         }
     }
 }
@@ -142,6 +144,8 @@ pub struct LauncherUi {
     pub(crate) last_source: Option<Source>,
     pub(crate) rate_limited_until: Option<i64>,
     pub(crate) launcher_update: Option<Release>,
+    pub(crate) version_lists: std::collections::HashMap<String, Result<Vec<Release>, String>>,
+    pub(crate) version_requests: std::collections::HashSet<String>,
     /// The launcher's own update, while it downloads and installs.
     pub(crate) launcher_job: Option<artcraft_launcher_core::protocol::JobPhase>,
     /// The new launcher is in place: quit so it can start.
@@ -248,6 +252,8 @@ impl LauncherUi {
             last_source: None,
             rate_limited_until: None,
             launcher_update: None,
+            version_lists: std::collections::HashMap::new(),
+            version_requests: std::collections::HashSet::new(),
             launcher_job: None,
             restart_requested: false,
             announcements: Vec::new(),
@@ -426,6 +432,8 @@ impl LauncherUi {
         let options = BackendOptions {
             kinds: self.settings.preferred_kinds.clone(),
             prereleases: self.settings.prereleases,
+            versions: self.settings.versions.clone(),
+            launcher_version: self.settings.launcher_version.clone(),
             install_locations: self.settings.install_locations.clone(),
         };
         if self.sent_options.as_ref() != Some(&options) {
@@ -440,6 +448,19 @@ impl LauncherUi {
                 matches!(p.os, artcraft_launcher_core::Os::Windows | artcraft_launcher_core::Os::MacOs | artcraft_launcher_core::Os::Linux)
             })
             && !crate::settings::is_flatpak_sandbox()
+    }
+
+    pub(crate) fn request_versions(&mut self, id: &str) {
+        if !self.version_lists.contains_key(id) && self.version_requests.insert(id.to_string()) {
+            self.act_command(Command::ListVersions { app: id.to_string() });
+        }
+    }
+
+    pub(crate) fn open_versions(&mut self, id: &str) {
+        self.version_lists.remove(id);
+        self.version_requests.remove(id);
+        self.dialog = Some(Dialog::Versions(id.to_string()));
+        self.request_versions(id);
     }
 
     /// Asks to install `id`. On a host that supports custom folders and for an app that is not
@@ -507,6 +528,11 @@ impl LauncherUi {
             Event::Latest { app, latest, from } => {
                 self.on_latest(app, latest, from);
                 true
+            }
+            Event::Versions { app, result } => {
+                self.version_requests.remove(&app);
+                self.version_lists.insert(app, result);
+                false
             }
             Event::Screenshot { app, key, result } => {
                 self.pictures.insert((app, key), crate::details::Picture::from_result(result));

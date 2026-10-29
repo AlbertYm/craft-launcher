@@ -10,7 +10,7 @@ use artcraft_launcher_core::feed::{Feed, FeedAnswer};
 use artcraft_launcher_core::platform::{Arch, Os, Platform, pick_asset};
 use artcraft_launcher_core::protocol::{
     Backend, BackendOptions, CANCELLED, Capabilities, Command, Event, INSTALL_CANCELLED, JobPhase, LatestRelease, Origin, PAUSED, PausedDownload,
-    Source,
+    Source, VersionTrack,
 };
 use artcraft_launcher_core::release::{Asset, Release};
 use artcraft_launcher_core::{CraftApp, Installed, PackageKind, SUITE, version};
@@ -264,7 +264,8 @@ impl NativeBackend {
         let busy = BusyGuard { shared: shared.clone(), flag: BusyFlag::Checking };
         let paths = self.paths.clone();
         let platform = self.platform;
-        let pre = self.options().prereleases;
+        let options = self.options();
+        let pre = options.prereleases;
         let mirror = local_mirror();
         std::thread::spawn(move || {
             let busy = busy;
@@ -275,7 +276,7 @@ impl NativeBackend {
             }
             let now = crate::now();
             let queue = Mutex::new(SUITE.iter().chain(std::iter::once(&LAUNCHER)).collect::<Vec<&CraftApp>>());
-            let sources = sweep(&queue, &mirror, feed.as_ref(), fallback, &source, &shared, &paths, pre, force, now);
+            let sources = sweep(&queue, &mirror, feed.as_ref(), fallback, &source, &shared, &paths, &options, force, now);
             source.save();
             {
                 let answered = shared.answered.lock().unwrap_or_else(PoisonError::into_inner);
@@ -453,6 +454,14 @@ enum Work {
     Uninstall,
 }
 
+fn release_matches_track(release: &Release, track: &VersionTrack, prereleases: bool) -> bool {
+    match track {
+        VersionTrack::Stable => prereleases || (!release.prerelease && release.version.as_ref().is_some_and(version::is_stable)),
+        VersionTrack::Nightly => artcraft_launcher_core::release::is_nightly(release),
+        VersionTrack::Pinned(tag) => &release.tag == tag,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_install(
     app: &CraftApp,
@@ -477,7 +486,11 @@ fn run_install(
         .unwrap_or_else(PoisonError::into_inner)
         .get(app.id)
         .cloned()
-        .ok_or("the latest release hasn't been found yet. Check for updates first.")?;
+        .ok_or("the selected release hasn't been found yet. Check for updates first.")?;
+    let track = options.versions.get(app.id).unwrap_or(&VersionTrack::Stable);
+    if !release_matches_track(&release, track, options.prereleases) {
+        return Err("the selected version isn't available yet. Check for updates before installing.".into());
+    }
     let (asset, kind) = planned_asset(app, &release, platform, options, existing, record).ok_or_else(|| {
         if platform.os == artcraft_launcher_core::Os::Linux
             && options.install_locations.folder(app.id).is_some()
@@ -672,7 +685,7 @@ fn sweep(
     source: &Arc<dyn ReleaseSource>,
     shared: &Arc<Shared>,
     paths: &Paths,
-    pre: bool,
+    options: &BackendOptions,
     force: bool,
     now: i64,
 ) -> Vec<Source> {
@@ -682,9 +695,15 @@ fn sweep(
             scope.spawn(|| {
                 loop {
                     let Some(app) = queue.lock().unwrap_or_else(PoisonError::into_inner).pop() else { break };
+                    let track =
+                        if app.id == LAUNCHER_ID { &options.launcher_version } else { options.versions.get(app.id).unwrap_or(&VersionTrack::Stable) };
                     let (latest, from, used) = match mirror {
-                        Some(_) => mirror_latest(app, feed, now),
-                        None => latest_for(app, feed, fallback, source.as_ref(), shared, pre, force, now),
+                        Some(_) => mirror_chosen(app, feed, now, track),
+                        None if *track != VersionTrack::Stable => {
+                            let answer = source.chosen(&feed_repo(feed, app), track);
+                            (Some(answer.latest), Origin::GitHub, Some(answer.source))
+                        }
+                        None => latest_for(app, feed, fallback, source.as_ref(), shared, options.prereleases, force, now),
                     };
                     if let Some(used) = used {
                         sources.lock().unwrap_or_else(PoisonError::into_inner).push(used);
@@ -984,6 +1003,19 @@ fn mirror_latest(app: &CraftApp, feed: Option<&Feed>, now: i64) -> (Option<Lates
     (Some(latest), Origin::ArtCraftApi, Some(Source::Feed))
 }
 
+/// A selected track never silently falls back to the mirror's stable release.
+fn mirror_chosen(app: &CraftApp, feed: Option<&Feed>, now: i64, track: &VersionTrack) -> (Option<LatestRelease>, Origin, Option<Source>) {
+    let (answer, origin, source) = mirror_latest(app, feed, now);
+    let chosen = match (track, answer) {
+        (VersionTrack::Stable, answer) => answer,
+        (VersionTrack::Nightly, Some(LatestRelease::Found(r))) if artcraft_launcher_core::release::is_nightly(&r) => Some(LatestRelease::Found(r)),
+        (VersionTrack::Pinned(tag), Some(LatestRelease::Found(r))) if &r.tag == tag => Some(LatestRelease::Found(r)),
+        (_, Some(LatestRelease::Failed(why))) => Some(LatestRelease::Failed(why)),
+        _ => Some(LatestRelease::None),
+    };
+    (chosen, origin, source)
+}
+
 /// The last saved feed answer, if any.
 fn load_feed(paths: &Paths) -> Option<Feed> {
     std::fs::read_to_string(paths.feed_cache()).ok().and_then(|body| Feed::parse(&body))
@@ -1039,6 +1071,16 @@ impl Backend for NativeBackend {
         match command {
             Command::CheckForUpdates { force } => self.check(force),
             Command::Detect => self.detect_all(),
+            Command::ListVersions { app } => {
+                let Some(def) = (if app == LAUNCHER_ID { Some(&LAUNCHER) } else { CraftApp::by_id(&app) }) else { return };
+                let source = self.source.clone();
+                let shared = self.shared.clone();
+                let repo = feed_repo(load_feed(&self.paths).as_ref(), def);
+                std::thread::spawn(move || {
+                    let result = source.ok_or("secure connections aren't available on this system".to_string()).and_then(|s| s.versions(&repo));
+                    shared.emit(Event::Versions { app, result });
+                });
+            }
             Command::Install { app } => self.start_job(&app, Work::Install),
             Command::Replace { app } => self.start_job(&app, Work::Replace),
             Command::Uninstall { app } => self.start_job(&app, Work::Uninstall),
@@ -1087,7 +1129,8 @@ impl Backend for NativeBackend {
             Command::Configure(options) => {
                 let changed_pre = {
                     let mut o = self.shared.options.lock().unwrap_or_else(PoisonError::into_inner);
-                    let changed = o.prereleases != options.prereleases;
+                    let changed =
+                        o.prereleases != options.prereleases || o.versions != options.versions || o.launcher_version != options.launcher_version;
                     *o = options;
                     changed
                 };
@@ -1137,6 +1180,19 @@ mod tests {
     use super::*;
 
     use crate::source::Answer;
+
+    #[test]
+    fn an_install_cannot_use_a_stale_release_from_a_different_track() {
+        let mut release = Release { tag: "v0.8.0".into(), version: version::parse("v0.8.0"), ..Default::default() };
+        assert!(!release_matches_track(&release, &VersionTrack::Nightly, false));
+        assert!(!release_matches_track(&release, &VersionTrack::Pinned("v0.7.0".into()), false));
+        assert!(release_matches_track(&release, &VersionTrack::Stable, false));
+        release.tag = "v0.9.0-nightly.20261028".into();
+        release.version = version::parse(&release.tag);
+        release.prerelease = true;
+        assert!(release_matches_track(&release, &VersionTrack::Nightly, false));
+        assert!(!release_matches_track(&release, &VersionTrack::Stable, false));
+    }
 
     #[test]
     fn feed_url_overrides_are_loopback_only_outside_local_mirror_builds() {

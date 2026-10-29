@@ -371,6 +371,156 @@ fn install_commands(sent: &RefCell<Vec<Command>>) -> Vec<Command> {
 }
 
 #[test]
+fn app_and_launcher_offer_version_choices_without_starting_an_install() {
+    let (mut h, sent) = harness(ViewMode::Grid, egui::Theme::Dark, true);
+    h.run_steps(6);
+    h.get_by_label("More actions for PhotoCraft").click();
+    h.run_steps(3);
+    h.get_by_label("Choose version").click();
+    h.run_steps(3);
+    h.get_by_role_and_label(egui::accesskit::Role::ComboBox, "Version");
+    assert!(sent.borrow().iter().any(|c| matches!(c, Command::ListVersions { app } if app == "photocraft")));
+    assert!(!sent.borrow().iter().any(|c| matches!(c, Command::Install { .. })));
+    h.get_by_label("Close").click();
+    h.run_steps(3);
+    h.get_by_label("Settings").click();
+    h.run_steps(4);
+    h.get_by_role_and_label(egui::accesskit::Role::ComboBox, "Launcher version").click();
+    h.run_steps(3);
+    h.get_by_label("Latest release");
+    h.get_by_label("No nightly build published yet");
+    assert!(h.query_by_label("Launcher versions").is_none(), "version selection belongs in Settings, not another dialog");
+    assert!(sent.borrow().iter().any(|c| matches!(c, Command::ListVersions { app } if app == artcraft_launcher_core::catalog::LAUNCHER_ID)));
+}
+
+#[test]
+fn version_choices_have_room_and_nightly_scrolls_with_the_versions() {
+    let releases: Vec<_> = (1..=25)
+        .rev()
+        .map(|v| {
+            let mut r = release("artcraft-launcher", &format!("0.{v}.0"), NOW);
+            r.assets[0].sha256 = Some("0".repeat(64));
+            r
+        })
+        .collect();
+    let mut ev = events();
+    ev.push(Event::Versions { app: artcraft_launcher_core::catalog::LAUNCHER_ID.into(), result: Ok(releases) });
+    let (mut h, _) = harness_with(ev, ViewMode::Grid, egui::Theme::Dark, true, 1.0);
+    h.set_size(egui::vec2(1180.0, 1100.0));
+    h.run_steps(6);
+    h.get_by_label("Settings").click();
+    h.run_steps(4);
+    h.get_by_role_and_label(egui::accesskit::Role::ComboBox, "Launcher version").click();
+    h.run_steps(5);
+    let nightly_before = h.get_by_label("Nightly").rect();
+    let first = h.get_by_label("v0.25.0").rect();
+    assert!(nightly_before.height() >= 40.0, "dropdown rows need a comfortable target: {nightly_before:?}");
+    assert!(first.top() - nightly_before.bottom() >= 8.0, "choices need breathing room: {nightly_before:?} {first:?}");
+    h.event(egui::Event::PointerMoved(first.center()));
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, -250.0),
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Wheel,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.run_steps(30);
+    let nightly_after = h.get_by_label("Nightly").rect();
+    assert!(nightly_after.top() < nightly_before.top() - 80.0, "Nightly must scroll with release rows: {nightly_before:?} -> {nightly_after:?}");
+}
+
+#[test]
+fn choosing_an_app_version_turns_its_main_action_into_install() {
+    // A backend that answers ListVersions, unlike the shared Fake: the dialog clears the cached
+    // list when it opens, so the choice only appears once the reply arrives.
+    struct VersionsFake {
+        events: Rc<RefCell<Vec<Event>>>,
+        sent: Rc<RefCell<Vec<Command>>>,
+        answer: Vec<Release>,
+    }
+    impl Backend for VersionsFake {
+        fn send(&mut self, command: Command) {
+            if let Command::ListVersions { app } = &command {
+                self.events.borrow_mut().push(Event::Versions { app: app.clone(), result: Ok(self.answer.clone()) });
+            }
+            self.sent.borrow_mut().push(command);
+        }
+        fn poll(&mut self) -> Vec<Event> {
+            std::mem::take(&mut *self.events.borrow_mut())
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities { manage_apps: true, reveal_label: "Show in Finder", self_update: true }
+        }
+        fn platform(&self) -> Option<Platform> {
+            Some(Platform { os: Os::MacOs, arch: Arch::Arm64 })
+        }
+        fn now(&self) -> i64 {
+            NOW
+        }
+    }
+    let mut pin = release("photocraft", "0.4.0", NOW);
+    pin.assets[0].sha256 = Some("0".repeat(64));
+    struct DummyHost;
+    impl Host for DummyHost {}
+    let mut ev = events();
+    ev.push(Event::Latest { app: "photocraft".into(), latest: LatestRelease::Found(pin.clone()), from: Origin::GitHub });
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let queue = Rc::new(RefCell::new(ev));
+    let mut backend = Some(VersionsFake { events: queue.clone(), sent: sent.clone(), answer: vec![pin] });
+    let harness = test_harness_builder(egui::Theme::Dark).with_size(egui::vec2(1180.0, 1200.0)).build_ui_state(
+        move |ui, state: &mut Option<LauncherUi>| {
+            if let Some(backend) = backend.take() {
+                *state = Some(LauncherUi::new(ui.ctx(), Box::new(backend), Settings { notify: false, ..Default::default() }));
+            }
+            if let Some(launcher) = state {
+                launcher.logic(ui.ctx(), &mut DummyHost);
+                launcher.ui(ui, &mut DummyHost);
+            }
+        },
+        None,
+    );
+    let mut h = harness;
+    h.run_steps(6);
+    h.get_by_label("More actions for PhotoCraft").click();
+    h.run_steps(3);
+    h.get_by_label("Choose version").click();
+    h.run_steps(4);
+    h.get_by_role_and_label(egui::accesskit::Role::ComboBox, "Version").click();
+    h.run_steps(4);
+    sent.borrow_mut().clear();
+    h.query_all_by_role_and_label(egui::accesskit::Role::Button, "v0.4.0").next().unwrap().click();
+    h.run_steps(4);
+    assert!(
+        sent.borrow().iter().any(|c| matches!(c, Command::CheckForUpdates { force: true })),
+        "selection must refresh the release used by Install"
+    );
+    assert!(!sent.borrow().iter().any(|c| matches!(c, Command::Install { .. })), "selection itself must not install");
+    h.run_steps(2);
+    assert!(h.query_by_label("Version").is_none(), "choosing a version closes the dialog");
+    h.get_by_label("More actions for PhotoCraft").click();
+    h.run_steps(3);
+    assert!(h.query_by_label("Install selected version").is_none(), "no second install action should hide in the menu");
+    h.get_all_by_label("Install version v0.4.0").next().unwrap().click();
+    h.run_steps(2);
+    assert!(sent.borrow().iter().any(|c| matches!(c, Command::Install { app } if app == "photocraft")));
+    assert!(!sent.borrow().iter().any(|c| matches!(c, Command::Launch { app } if app == "photocraft")));
+    // Once the pinned version is the installed copy, the card opens it again.
+    let opens = h.query_all_by_label("Open").count();
+    queue.borrow_mut().push(Event::Detected {
+        app: "photocraft".into(),
+        installed: Some(Installed {
+            version: version::parse("0.4.0"),
+            source: InstallSource::MacApp,
+            location: "/Applications/PhotoCraft.app".into(),
+            package: None,
+        }),
+    });
+    h.run_steps(4);
+    assert!(h.query_by_label("Install version v0.4.0").is_none(), "an installed pin is not offered again");
+    assert_eq!(h.query_all_by_label("Open").count(), opens + 1, "PhotoCraft shows Open");
+}
+
+#[test]
 /// A custom-folder install opens a confirmation dialog with no command until Install; the
 /// chosen root and per-app folder are persisted, Configure precedes Install, and Cancel keeps
 /// no override.

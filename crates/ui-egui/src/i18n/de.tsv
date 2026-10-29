@@ -384,3 +384,12 @@ filter	Installed	Installiert
 	Last updated: {date}	Zuletzt aktualisiert: {date}
 column	Version	Version
 column	Author	Autor
+	Choose version	Version auswählen
+	Launcher version	Launcher-Version
+	Nightly	Nightly
+	No nightly build published yet	Noch kein Nightly-Build veröffentlicht
+	Install version {version}	Version {version} installieren
+	Download selected version	Ausgewählte Version herunterladen
+	Older launcher versions require a manual reinstall.	Ältere Launcher-Versionen müssen manuell neu installiert werden.
+	After choosing a version, Install version appears in place of Open. Your files may not open in older versions.	Nach der Wahl einer Version erscheint anstelle von Öffnen die Schaltfläche Version installieren. Ältere Versionen können deine Dateien möglicherweise nicht öffnen.
+	Enable automatic installs in Settings to follow new nightly builds.	Aktiviere automatische Installationen in den Einstellungen, um neuen Nightly-Builds zu folgen.

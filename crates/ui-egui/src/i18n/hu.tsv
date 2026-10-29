@@ -385,3 +385,12 @@ filter	Installed	Telepítve
 	Last updated: {date}	Utoljára frissítve: {date}
 column	Version	Verzió
 column	Author	Szerző
+	Choose version	Verzió kiválasztása
+	Launcher version	Az indító verziója
+	Nightly	Éjszakai kiadás
+	No nightly build published yet	Még nincs közzétett éjszakai kiadás
+	Install version {version}	A(z) {version} verzió telepítése
+	Download selected version	Kiválasztott verzió letöltése
+	Older launcher versions require a manual reinstall.	Az indító régebbi verzióit kézzel kell újratelepíteni.
+	After choosing a version, Install version appears in place of Open. Your files may not open in older versions.	Verzió kiválasztása után a Telepítés gomb jelenik meg a Megnyitás helyén. Előfordulhat, hogy a régebbi verziók nem tudják megnyitni a fájljaidat.
+	Enable automatic installs in Settings to follow new nightly builds.	Az új éjszakai kiadások követéséhez kapcsold be az automatikus telepítést a beállításokban.
