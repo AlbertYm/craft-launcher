@@ -23,6 +23,7 @@
 
 use std::path::{Path, PathBuf};
 
+use artcraft_launcher_core::Arch;
 use artcraft_launcher_core::protocol::{CANCELLED, INSTALL_CANCELLED, InstallLocations, JobPhase};
 use artcraft_launcher_core::release::{self, Asset, Release};
 use artcraft_launcher_core::{CraftApp, InstallSource, Installed, PackageKind, version};
@@ -102,8 +103,8 @@ pub fn install_at(
             crate::msi_context::probe,
             |code| crate::detect::windows::record_scope(app, code),
         )?;
-        // A fresh install keeps the package's own default unless the chosen folder needs administrator rights.
-        updated.or_else(|| if existing.is_none() { crate::msi_context::fresh_scope(destination.as_deref(), can_create_files_in) } else { None })
+        // A fresh install is machine-wide (Program Files); an update keeps the context of the copy it replaces.
+        crate::msi_context::install_scope(updated, existing.is_none())
     } else {
         None
     };
@@ -287,6 +288,42 @@ fn destination(
     Ok(Some(if kind == PackageKind::Msi { parent.join(app.name) } else { parent }))
 }
 
+/// The folder a new install goes inside when the person hasn't chosen one, so the UI can show
+/// that folder instead of only saying "System default". The answer follows the package: a
+/// Windows MSI installs for everyone into `Program Files\ArtCraft\<App>`, and a 32-bit package
+/// into the 32-bit Program Files, so `arch` is the package's architecture when the release names
+/// one and `None` (the release is unknown) answers nothing. A portable ZIP unpacks into the
+/// launcher's own `apps` folder. A macOS app goes wherever the installer would put it
+/// (`/Applications`, or `~/Applications` when the system folder is not writable). Formats the
+/// system itself manages (the distro's packages on Linux, Flatpak) have no single folder, so
+/// they answer `None`.
+pub fn default_folder(kind: PackageKind, arch: Option<Arch>, paths: &Paths) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        match kind {
+            PackageKind::Msi => match arch {
+                Some(Arch::X86) => {
+                    Some(PathBuf::from(std::env::var_os("ProgramFiles(x86)").or_else(|| std::env::var_os("ProgramFiles"))?).join("ArtCraft"))
+                }
+                Some(_) => Some(PathBuf::from(std::env::var_os("ProgramFiles")?).join("ArtCraft")),
+                None => None,
+            },
+            PackageKind::PortableZip => Some(paths.apps()),
+            _ => None,
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (arch, paths);
+        (kind == PackageKind::Dmg).then(macos::default_applications_dir).flatten()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (kind, arch, paths);
+        None
+    }
+}
+
 fn selected_folder(folder: &str, writable: bool) -> Result<PathBuf, String> {
     let path = if folder == "~" {
         dirs::home_dir().ok_or("no home folder")?
@@ -322,11 +359,17 @@ fn write_probe(dir: &Path) -> std::io::Result<()> {
     std::fs::remove_file(&probe)
 }
 
-/// Whether this account can create files where `path` goes: `path` itself, or the nearest folder above it
-/// that exists (an install folder is created by the installer).
-#[cfg(windows)]
-fn can_create_files_in(path: &Path) -> bool {
-    path.ancestors().find(|folder| folder.is_dir()).is_some_and(|folder| write_probe(folder).is_ok())
+/// The folder a new macOS app goes inside: `system` (`/Applications`) when this account can
+/// create files there, else `Applications` in `home`. It creates nothing, so the install-folder
+/// hint can ask on a redraw: `write_probe` takes a fresh name with `create_new`, so a link
+/// planted in `/Applications` is never followed and no existing file is touched. The installer
+/// creates `~/Applications` itself when it gets that answer.
+#[cfg(any(target_os = "macos", test))]
+fn mac_applications_dir(system: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    if write_probe(system).is_ok() {
+        return Some(system.to_path_buf());
+    }
+    home.map(|home| home.join("Applications"))
 }
 
 #[cfg(any(windows, test))]
@@ -340,8 +383,7 @@ fn msi_folder_argument(path: &Path) -> Result<String, String> {
 
 /// The Windows Installer context an update must keep. A per-machine install elevates and writes
 /// HKLM registrations; a per-user one must not silently become a second, per-machine copy (or
-/// the other way round). A fresh install passes `None` and takes the package's own default,
-/// which is per-user for a dual-scope package.
+/// the other way round). A fresh install is always `PerMachine`.
 #[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MsiScope {
@@ -1344,7 +1386,9 @@ pub mod macos {
 
     use super::{CraftApp, InstallSource, Installed, Path, PathBuf, Paths, Release, process, staging_dir, swap_into_place};
 
-    /// `/Applications` when we can write there, else `~/Applications`.
+    const SYSTEM_APPLICATIONS: &str = "/Applications";
+
+    /// `/Applications` when we can write there, else `~/Applications`, which is created.
     fn applications_dir(existing: Option<&Installed>, destination: Option<&Path>) -> Result<PathBuf, String> {
         if let Some(parent) =
             existing.filter(|i| i.source == InstallSource::MacApp).and_then(|i| Path::new(&i.location).parent().map(Path::to_path_buf))
@@ -1354,15 +1398,16 @@ pub mod macos {
         if let Some(dir) = destination {
             return Ok(dir.to_path_buf());
         }
-        let system = PathBuf::from("/Applications");
-        let probe = system.join(".artcraft-launcher-write-test");
-        if std::fs::write(&probe, b"").is_ok() {
-            let _ = std::fs::remove_file(&probe);
-            return Ok(system);
+        let dir = default_applications_dir().ok_or("no home folder")?;
+        if dir != Path::new(SYSTEM_APPLICATIONS) {
+            std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't create {} ({e})", dir.display()))?;
         }
-        let user = dirs::home_dir().ok_or("no home folder")?.join("Applications");
-        std::fs::create_dir_all(&user).map_err(|e| format!("couldn't create {} ({e})", user.display()))?;
-        Ok(user)
+        Ok(dir)
+    }
+
+    /// The same choice as a fresh install makes, creating nothing: the install-folder hint.
+    pub(super) fn default_applications_dir() -> Option<PathBuf> {
+        super::mac_applications_dir(Path::new(SYSTEM_APPLICATIONS), dirs::home_dir().as_deref())
     }
 
     /// The Apple Developer team that signs every Craft App and ArtCraft Launcher (Learning
@@ -1889,6 +1934,74 @@ mod tests {
         assert_eq!(keep_if_in_scope(folder.clone(), true), folder);
         assert_eq!(keep_if_in_scope(folder, false), None);
         assert_eq!(keep_if_in_scope(None, true), None);
+    }
+
+    /// The default folder shown in the UI is the one a fresh install really uses.
+    #[cfg(windows)]
+    #[test]
+    fn the_default_folder_is_the_artcraft_suite_folder_in_program_files() {
+        let paths = Paths::under(std::path::Path::new(r"C:\scratch"));
+        let program_files = std::env::var_os("ProgramFiles").map(PathBuf::from).unwrap();
+        assert_eq!(default_folder(PackageKind::Msi, Some(Arch::X64), &paths), Some(program_files.join("ArtCraft")));
+        assert_eq!(default_folder(PackageKind::PortableZip, Some(Arch::X64), &paths), Some(paths.apps()));
+        assert_eq!(default_folder(PackageKind::Dmg, Some(Arch::X64), &paths), None);
+    }
+
+    /// A 32-bit package installs under the 32-bit Program Files; an unknown architecture answers
+    /// nothing, so the UI says "System default" instead of guessing the destination.
+    #[cfg(windows)]
+    #[test]
+    fn a_32_bit_package_uses_the_32_bit_program_files_and_an_unknown_architecture_answers_nothing() {
+        let paths = Paths::under(std::path::Path::new(r"C:\scratch"));
+        let x86 = std::env::var_os("ProgramFiles(x86)").or_else(|| std::env::var_os("ProgramFiles")).map(PathBuf::from).unwrap();
+        assert_eq!(default_folder(PackageKind::Msi, Some(Arch::X86), &paths), Some(x86.join("ArtCraft")));
+        assert_eq!(default_folder(PackageKind::Msi, None, &paths), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_default_folder_is_wherever_the_installer_would_put_a_new_app() {
+        let paths = Paths::under(std::path::Path::new("/tmp/scratch"));
+        // `/Applications` when we can write there, else `~/Applications`: the same choice the
+        // installer makes, so the hint never disagrees with where the app really goes.
+        assert_eq!(default_folder(PackageKind::Dmg, None, &paths), macos::default_applications_dir());
+        assert_eq!(default_folder(PackageKind::Msi, None, &paths), None);
+    }
+
+    /// The macOS default-folder answer is asked on a redraw, so it must leave the disk as it was:
+    /// nothing left in a writable `/Applications`, no `~/Applications` created when it is not.
+    #[test]
+    fn the_mac_default_folder_lookup_creates_nothing() {
+        let system = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(mac_applications_dir(system.path(), Some(home.path())), Some(system.path().to_path_buf()));
+        assert_eq!(std::fs::read_dir(system.path()).unwrap().count(), 0, "the write probe was left behind");
+
+        let unwritable = system.path().join("missing");
+        assert_eq!(mac_applications_dir(&unwritable, Some(home.path())), Some(home.path().join("Applications")));
+        assert!(!home.path().join("Applications").exists(), "a folder hint must not create ~/Applications");
+        assert_eq!(mac_applications_dir(&unwritable, None), None);
+    }
+
+    /// A link planted under the old fixed probe name must not be followed: the probe once wrote
+    /// through it and truncated whatever it pointed at.
+    #[cfg(unix)]
+    #[test]
+    fn the_mac_default_folder_lookup_does_not_write_through_a_planted_link() {
+        let system = tempfile::tempdir().unwrap();
+        let victim = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(victim.path(), b"keep me").unwrap();
+        std::os::unix::fs::symlink(victim.path(), system.path().join(".artcraft-launcher-write-test")).unwrap();
+        assert_eq!(mac_applications_dir(system.path(), None), Some(system.path().to_path_buf()));
+        assert_eq!(std::fs::read(victim.path()).unwrap(), b"keep me");
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    #[test]
+    fn formats_the_system_manages_have_no_single_default_folder() {
+        let paths = Paths::under(std::path::Path::new("/tmp/scratch"));
+        assert_eq!(default_folder(PackageKind::Deb, None, &paths), None);
+        assert_eq!(default_folder(PackageKind::AppImage, None, &paths), None);
     }
 
     #[cfg(unix)]
