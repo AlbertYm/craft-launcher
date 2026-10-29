@@ -383,6 +383,7 @@ filter	Installed	Installées
 column	Version	Version
 column	Author	Auteur
 	Choose version	Choisir une version
+	{version} (latest release)	{version} (dernière version)
 	Launcher version	Version du lanceur
 	Nightly	Nocturne
 	Nightly (none published yet)	Nocturne (pas encore publiée)

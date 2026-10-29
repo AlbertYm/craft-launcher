@@ -413,7 +413,9 @@ fn version_choices_have_room_and_nightly_scrolls_with_the_versions() {
     h.get_by_role_and_label(egui::accesskit::Role::ComboBox, "Launcher version").click();
     h.run_steps(5);
     let nightly_before = h.get_by_label("Nightly (none published yet)").rect();
-    let first = h.get_by_label("v0.25.0").rect();
+    // The newest release carries the label; there is no separate "Latest release" row.
+    let first = h.get_by_label("v0.25.0 (latest release)").rect();
+    assert!(h.query_by_label("Latest release").is_none(), "the latest version is labelled in place");
     assert!(nightly_before.height() >= 40.0, "dropdown rows need a comfortable target: {nightly_before:?}");
     // Rows touch, so a selected row's highlight fills its whole slot and the spacing stays even.
     assert!((first.top() - nightly_before.bottom()).abs() < 1.0, "rows sit at an even pitch: {nightly_before:?} {first:?}");
@@ -467,7 +469,10 @@ fn choosing_an_app_version_turns_its_main_action_into_install() {
     ev.push(Event::Latest { app: "photocraft".into(), latest: LatestRelease::Found(pin.clone()), from: Origin::GitHub });
     let sent = Rc::new(RefCell::new(Vec::new()));
     let queue = Rc::new(RefCell::new(ev));
-    let mut backend = Some(VersionsFake { events: queue.clone(), sent: sent.clone(), answer: vec![pin] });
+    // A newer release takes the "latest release" label, so v0.4.0 is a plain pin.
+    let mut newer = release("photocraft", "0.5.0", NOW);
+    newer.assets[0].sha256 = Some("0".repeat(64));
+    let mut backend = Some(VersionsFake { events: queue.clone(), sent: sent.clone(), answer: vec![newer, pin] });
     let harness = test_harness_builder(egui::Theme::Dark).with_size(egui::vec2(1180.0, 1200.0)).build_ui_state(
         move |ui, state: &mut Option<LauncherUi>| {
             if let Some(backend) = backend.take() {
@@ -488,6 +493,7 @@ fn choosing_an_app_version_turns_its_main_action_into_install() {
     h.run_steps(4);
     h.get_by_role_and_label(egui::accesskit::Role::ComboBox, "Version").click();
     h.run_steps(4);
+    assert!(h.query_all_by_role_and_label(egui::accesskit::Role::Button, "v0.5.0 (latest release)").next().is_some());
     sent.borrow_mut().clear();
     h.query_all_by_role_and_label(egui::accesskit::Role::Button, "v0.4.0").next().unwrap().click();
     h.run_steps(4);

@@ -385,6 +385,7 @@ filter	Installed	Installiert
 column	Version	Version
 column	Author	Autor
 	Choose version	Version auswählen
+	{version} (latest release)	{version} (neueste Version)
 	Launcher version	Launcher-Version
 	Nightly	Nightly
 	Nightly (none published yet)	Nightly (noch keins veröffentlicht)

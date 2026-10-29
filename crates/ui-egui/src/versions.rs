@@ -1,7 +1,7 @@
 //! Published-release selector. A choice changes the release used by future checks, not a running install.
 use artcraft_launcher_core::catalog::{CraftApp, LAUNCHER, LAUNCHER_ID};
 use artcraft_launcher_core::protocol::VersionTrack;
-use artcraft_launcher_core::release::{Release, is_nightly};
+use artcraft_launcher_core::release::{Release, choose_version, is_nightly};
 use artcraft_launcher_core::version;
 use egui::{RichText, Ui};
 
@@ -73,8 +73,17 @@ impl LauncherUi {
             if id == LAUNCHER_ID { self.settings.launcher_version.clone() } else { self.settings.versions.get(id).cloned().unwrap_or_default() };
         let list = self.version_lists.get(id).cloned();
         let mut picked = None;
+        // The newest stable release that installs here is labelled as the latest, and choosing it
+        // follows new releases. Until the list is in, a plain "Latest release" row keeps that choice.
+        let latest = list
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .and_then(|releases| choose_version(releases, &VersionTrack::Stable))
+            .filter(|r| self.has_version_download(app, r))
+            .map(|r| r.tag);
+        let latest_label = |tag: &str| crate::fmt(tl!("{version} (latest release)"), &[("version", tag)]);
         let summary = match &choice {
-            VersionTrack::Stable => tl!("Latest release").to_string(),
+            VersionTrack::Stable => latest.as_deref().map_or_else(|| tl!("Latest release").to_string(), latest_label),
             VersionTrack::Nightly => tl!("Nightly").to_string(),
             VersionTrack::Pinned(tag) => tag.clone(),
         };
@@ -88,7 +97,9 @@ impl LauncherUi {
                 // highlight covers only part of its slot and the spacing looks uneven around it.
                 ui.spacing_mut().item_spacing.y = 0.0;
                 let option_size = egui::vec2(ui.available_width(), 42.0);
-                if ui.add(egui::Button::selectable(choice == VersionTrack::Stable, tl!("Latest release")).min_size(option_size)).clicked() {
+                if latest.is_none()
+                    && ui.add(egui::Button::selectable(choice == VersionTrack::Stable, tl!("Latest release")).min_size(option_size)).clicked()
+                {
                     picked = Some(VersionTrack::Stable);
                 }
                 let nightly = list
@@ -116,9 +127,14 @@ impl LauncherUi {
                             if !self.has_version_download(app, r) {
                                 continue;
                             }
-                            let tag = &r.tag;
-                            if ui.add(egui::Button::selectable(choice == VersionTrack::Pinned(tag.clone()), tag).min_size(option_size)).clicked() {
-                                picked = Some(VersionTrack::Pinned(tag.clone()));
+                            let pin = VersionTrack::Pinned(r.tag.clone());
+                            let (selected, text, track) = if latest.as_ref() == Some(&r.tag) {
+                                (choice == VersionTrack::Stable || choice == pin, latest_label(&r.tag), VersionTrack::Stable)
+                            } else {
+                                (choice == pin, r.tag.clone(), pin)
+                            };
+                            if ui.add(egui::Button::selectable(selected, text).min_size(option_size)).clicked() {
+                                picked = Some(track);
                             }
                         }
                     }

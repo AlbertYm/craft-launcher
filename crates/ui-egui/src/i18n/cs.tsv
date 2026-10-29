@@ -353,6 +353,7 @@ filter	Installed	Nainstalováno
 column	Version	Verze
 column	Author	Autor
 	Choose version	Vybrat verzi
+	{version} (latest release)	{version} (nejnovější verze)
 	Launcher version	Verze spouštěče
 	Nightly	Noční sestavení
 	Nightly (none published yet)	Noční sestavení (zatím žádné)

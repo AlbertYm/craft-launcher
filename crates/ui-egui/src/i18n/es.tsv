@@ -366,6 +366,7 @@ filter	Installed	Instaladas
 column	Version	Versión
 column	Author	Autor
 	Choose version	Elegir versión
+	{version} (latest release)	{version} (última versión)
 	Launcher version	Versión del iniciador
 	Nightly	Nocturna
 	Nightly (none published yet)	Nocturna (aún no publicada)
