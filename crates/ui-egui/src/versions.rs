@@ -84,8 +84,9 @@ impl LauncherUi {
             .height(390.0)
             .show_ui(ui, |ui| {
                 // The combo already scrolls its entire menu. Keep every option, including
-                // Nightly, in that one scroll region.
-                ui.spacing_mut().item_spacing.y = 10.0;
+                // Nightly, in that one scroll region. Rows touch: with a gap, the selected row's
+                // highlight covers only part of its slot and the spacing looks uneven around it.
+                ui.spacing_mut().item_spacing.y = 0.0;
                 let option_size = egui::vec2(ui.available_width(), 42.0);
                 if ui.add(egui::Button::selectable(choice == VersionTrack::Stable, tl!("Latest release")).min_size(option_size)).clicked() {
                     picked = Some(VersionTrack::Stable);

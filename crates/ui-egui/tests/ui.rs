@@ -415,7 +415,8 @@ fn version_choices_have_room_and_nightly_scrolls_with_the_versions() {
     let nightly_before = h.get_by_label("Nightly (none published yet)").rect();
     let first = h.get_by_label("v0.25.0").rect();
     assert!(nightly_before.height() >= 40.0, "dropdown rows need a comfortable target: {nightly_before:?}");
-    assert!(first.top() - nightly_before.bottom() >= 8.0, "choices need breathing room: {nightly_before:?} {first:?}");
+    // Rows touch, so a selected row's highlight fills its whole slot and the spacing stays even.
+    assert!((first.top() - nightly_before.bottom()).abs() < 1.0, "rows sit at an even pitch: {nightly_before:?} {first:?}");
     h.event(egui::Event::PointerMoved(first.center()));
     h.event(egui::Event::MouseWheel {
         unit: egui::MouseWheelUnit::Point,
