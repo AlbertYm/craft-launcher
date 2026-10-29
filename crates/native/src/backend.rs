@@ -464,6 +464,13 @@ fn release_matches_track(release: &Release, track: &VersionTrack, prereleases: b
     }
 }
 
+/// Whether `chosen` is a version picked by name that is older than the installed copy.
+fn is_chosen_downgrade(track: &VersionTrack, chosen: &Release, existing: Option<&Installed>) -> bool {
+    let VersionTrack::Pinned(tag) = track else { return false };
+    let (Some(chosen_v), Some(installed_v)) = (chosen.version.as_ref(), existing.and_then(|i| i.version.as_ref())) else { return false };
+    chosen.tag == *tag && version::is_newer(installed_v, chosen_v)
+}
+
 /// For a version chosen by name that is older than the installed copy: the installed version's own
 /// published release, to put back if the downgrade fails. `None` for anything else, without
 /// asking `list`. An error means the downgrade can't be made safe, so it must not start.
@@ -474,11 +481,9 @@ fn downgrade_previous(
     existing: Option<&Installed>,
     list: impl FnOnce() -> Result<Vec<Release>, String>,
 ) -> Result<Option<Release>, String> {
-    let VersionTrack::Pinned(tag) = track else { return Ok(None) };
-    let (Some(chosen_v), Some(installed_v)) = (chosen.version.as_ref(), existing.and_then(|i| i.version.as_ref())) else { return Ok(None) };
-    if chosen.tag != *tag || !version::is_newer(installed_v, chosen_v) {
+    let Some(installed_v) = existing.and_then(|i| i.version.as_ref()).filter(|_| is_chosen_downgrade(track, chosen, existing)) else {
         return Ok(None);
-    }
+    };
     let releases =
         list().map_err(|e| format!("couldn't find {} {installed_v} to put back if going back fails ({e}), so nothing was changed.", app.name))?;
     releases.into_iter().find(|r| r.version.as_ref() == Some(installed_v)).map(Some).ok_or_else(|| {
@@ -527,11 +532,19 @@ fn run_install(
             format!("{} {} has no download for {}", app.name, release.version_label(), platform.label())
         }
     })?;
-    // Going back to a version chosen by name: the installed version's own package is found first,
-    // so a downgrade that fails can put it back. Without it nothing changes.
-    let previous = downgrade_previous(app, track, &release, existing, || {
-        source.ok_or_else(|| "secure connections aren't available on this system".to_string())?.versions(&feed_repo(load_feed(paths).as_ref(), app))
-    })?;
+    // Going back to a version chosen by name. A macOS bundle keeps the old copy aside until the
+    // new one is in place. Otherwise the installed version's own package is found first, so a
+    // downgrade that fails can put it back. Without it nothing changes.
+    let keeps_old_copy = install::keeps_old_copy(kind, existing);
+    let previous = if keeps_old_copy {
+        None
+    } else {
+        downgrade_previous(app, track, &release, existing, || {
+            source
+                .ok_or_else(|| "secure connections aren't available on this system".to_string())?
+                .versions(&feed_repo(load_feed(paths).as_ref(), app))
+        })?
+    };
     let previous_asset = match &previous {
         Some(p) => Some(
             planned_asset(app, p, platform, options, existing, record)
@@ -541,7 +554,11 @@ fn run_install(
         ),
         None => None,
     };
-    let downgrade = previous.as_ref().zip(previous_asset.as_ref()).map(|(previous, asset)| install::Downgrade { previous, asset });
+    let downgrade = if keeps_old_copy {
+        is_chosen_downgrade(track, &release, existing).then_some(install::Downgrade::KeepOldCopy)
+    } else {
+        previous.as_ref().zip(previous_asset.as_ref()).map(|(previous, asset)| install::Downgrade::Reinstall { previous, asset })
+    };
     if !replace && let Some(path) = install::occupied(app, &asset, kind, existing, record, &options.install_locations, paths)? {
         shared.emit(Event::Occupied { app: app.id.to_string(), path: path.display().to_string() });
         return Err(format!("{} already exists", path.display()));
@@ -1223,6 +1240,17 @@ mod tests {
 
     fn tagged(v: &str) -> Release {
         Release { tag: format!("v{v}"), version: version::parse(v), ..Default::default() }
+    }
+
+    #[test]
+    fn a_downgrade_is_only_a_version_chosen_by_name_below_the_installed_one() {
+        let installed = Installed { version: version::parse("0.14.0"), source: InstallSource::MacApp, location: String::new(), package: None };
+        let pinned = VersionTrack::Pinned("v0.13.0".into());
+        assert!(is_chosen_downgrade(&pinned, &tagged("0.13.0"), Some(&installed)));
+        assert!(!is_chosen_downgrade(&VersionTrack::Stable, &tagged("0.13.0"), Some(&installed)));
+        assert!(!is_chosen_downgrade(&VersionTrack::Pinned("v0.15.0".into()), &tagged("0.15.0"), Some(&installed)));
+        assert!(!is_chosen_downgrade(&pinned, &tagged("0.12.0"), Some(&installed)));
+        assert!(!is_chosen_downgrade(&pinned, &tagged("0.13.0"), None));
     }
 
     #[test]
