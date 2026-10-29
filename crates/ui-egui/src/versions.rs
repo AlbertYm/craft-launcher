@@ -99,7 +99,6 @@ impl LauncherUi {
                 if ui.add_enabled(nightly, egui::Button::selectable(choice == VersionTrack::Nightly, label).min_size(option_size)).clicked() {
                     picked = Some(VersionTrack::Nightly);
                 }
-                ui.separator();
                 match &list {
                     None => {
                         ui.spinner();
